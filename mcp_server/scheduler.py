@@ -123,6 +123,11 @@ class SchedulerService:
             return
         run = self._store.start_run(tool_id)
         try:
+            if tool.action not in self._store.allowed_actions:
+                # Задача заведена раньше, когда этот вид действия был
+                # включён (например, git_pull при MCP_LOCAL_GIT_ENABLED=true),
+                # а теперь выключен — не выполняем, а фиксируем причину в истории.
+                raise RuntimeError(f"Действие '{tool.action}' выключено настройками MCP-сервера")
             result = await execute_action(tool.action, tool.params)
             self._store.finish_run(run.id, ok=True, result=result)
         except Exception as exc:

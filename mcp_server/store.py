@@ -40,8 +40,12 @@ def _now() -> int:
 
 
 class SchedulerStore:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, allowed_actions: Optional[List[str]] = None):
+        """`allowed_actions` — виды задач, которые можно ЗАВОДИТЬ на этом
+        сервере (см. `features.Features.action_kinds`: без локального Git
+        нет `git_pull`); `None` — все `ACTION_KINDS`."""
         self._db = db
+        self.allowed_actions: List[str] = list(ACTION_KINDS if allowed_actions is None else allowed_actions)
 
     # ---- scheduled_tools ---------------------------------------------------
 
@@ -49,7 +53,11 @@ class SchedulerStore:
         if not name or not name.strip():
             raise ValidationError("Название задачи не может быть пустым")
         if action not in ACTION_KINDS:
-            raise ValidationError(f"Неизвестное действие '{action}': допустимо {ACTION_KINDS}")
+            raise ValidationError(f"Неизвестное действие '{action}': допустимо {self.allowed_actions}")
+        if action not in self.allowed_actions:
+            raise ValidationError(
+                f"Действие '{action}' выключено на этом сервере: допустимо {self.allowed_actions}"
+            )
         try:
             validate_schedule(schedule)
         except ScheduleError as exc:

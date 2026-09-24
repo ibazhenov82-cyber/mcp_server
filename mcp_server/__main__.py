@@ -28,6 +28,12 @@ def main() -> None:
     import uvicorn
 
     app = create_app()
+
+    def _onoff(flag: bool) -> str:
+        return "включено" if flag else "выключено"
+
+    print(f"[mcp_server] Локальный Git (MCP_LOCAL_GIT_ENABLED): {_onoff(MCPConfig.LOCAL_GIT_ENABLED)}")
+    print(f"[mcp_server] Периодические задачи (MCP_SCHEDULER_ENABLED): {_onoff(MCPConfig.SCHEDULER_ENABLED)}")
     uvicorn.run(app, host=MCPConfig.HOST, port=MCPConfig.PORT)
 
 

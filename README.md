@@ -20,6 +20,14 @@ cp .env.example .env   # и отредактировать под себя
 python -m mcp_server
 ```
 
+**Версия SDK `mcp` жёстко закреплена `<2`** (см. `requirements.txt`) — код
+написан против API `mcp` 1.x (`from mcp.server.fastmcp import FastMCP`). В
+`mcp` 2.x `FastMCP` переименован в `MCPServer` и переехал в
+`mcp.server.mcpserver` — если увидите при запуске
+`ModuleNotFoundError: No module named 'mcp.server.fastmcp'`, значит в
+окружении уже стоит 2.x (например, было установлено раньше для другого
+проекта) — переустановите зависимость: `pip install "mcp[cli]<2"`.
+
 По умолчанию слушает `0.0.0.0:8001`. AgentsCore должен указывать на
 `http://<host>:8001/mcp` (конфиг `MCP_SERVER_URL`), AgentsApp — на
 `http://<host>:8001/api/...`.
@@ -48,8 +56,33 @@ python -m mcp_server
 | `MCP_API_KEY` | заготовка под будущую аутентификацию (пока не используется) |
 | `GITHUB_TOKEN`/`GITLAB_TOKEN`/`GITEA_TOKEN` + `*_API_URL` | доступ к Git-хостингам; без токена — анонимный режим для публичных репозиториев |
 | `MCP_HTTP_TIMEOUT` | таймаут HTTP-запросов (сек) |
+| `MCP_LOCAL_GIT_ENABLED` | работа с локальными рабочими копиями git (`execute_git_command`, задачи `git_pull`); по умолчанию **выключено** |
+| `MCP_SCHEDULER_ENABLED` | периодические задачи и планировщик; по умолчанию **выключено** |
+
+### Включаемые возможности
+
+Пока настройка не задана (или `false`), инструменты группы **не попадают в
+список доступных** — ни агенту (AgentsCore получает их через MCP
+`tools/list`), ни приложению (`GET /api/tools`):
+
+| Настройка | Что включает |
+|---|---|
+| `MCP_LOCAL_GIT_ENABLED=true` | `execute_git_command`; вид задачи `git_pull` (если включены и периодические задачи) |
+| `MCP_SCHEDULER_ENABLED=true` | `register_scheduled_tool`, `list_scheduled_tools`, `cancel_scheduled_tool`, `save_result`; REST `/api/scheduled-tools*` (без настройки — `409 {"error": ...}`); виды задач в `/api/tools`; сам планировщик |
+
+Инструменты Git-хостингов (`git_host_*`) доступны всегда. Текущее состояние
+обеих настроек печатается при старте и отдаётся в `GET /api/status`
+(`scheduling_enabled`, `local_git_enabled`) — AgentsApp по ним прячет раздел
+периодических задач. Если выключить настройку, уже заведённые задачи
+остаются в базе: без `MCP_SCHEDULER_ENABLED` они не срабатывают вовсе, а
+задачи `git_pull` без `MCP_LOCAL_GIT_ENABLED` при срабатывании записывают в
+историю ошибку «действие выключено», не выполняясь.
 
 ## MCP-инструменты (`/mcp`, для AgentsCore)
+
+Инструменты периодических задач и `execute_git_command` регистрируются,
+только если включены соответствующей настройкой (см. «Включаемые
+возможности» выше).
 
 - `register_scheduled_tool(name, schedule, action, params, description=None, input_schema=None)` —
   завести периодическую задачу. `schedule`: `"every:<N><s|m|h>"` (например
@@ -98,8 +131,8 @@ register_scheduled_tool(
 
 | Метод | Путь | Назначение |
 |---|---|---|
-| GET | `/api/status` | `{scheduler_running, tool_count, scheduled_count}` |
-| GET | `/api/tools` | доступные инструменты `{name, description, parameters, schedulable}` |
+| GET | `/api/status` | `{scheduler_running, tool_count, scheduled_count, scheduling_enabled, local_git_enabled}` |
+| GET | `/api/tools` | доступные инструменты `{name, title, description, parameters, schedulable}`; `title` — краткое русское описание для интерфейса |
 | GET | `/api/scheduled-tools` | список периодических задач |
 | POST | `/api/scheduled-tools` | создать задачу |
 | PATCH | `/api/scheduled-tools/{id}` | частично изменить (в т.ч. `enabled`) |
@@ -131,7 +164,8 @@ MCP-инструмента). Остальные перечисленные ин�
   конфигурации на всех трёх сторонах, чтобы включить проверку позже без
   переделки кода. До тех пор сервер следует разворачивать в доверенной сети
   (не выставлять напрямую в интернет).
-- `execute_git_command` выполняет **произвольную** git-подкоманду
+- `execute_git_command` по умолчанию **выключен** (`MCP_LOCAL_GIT_ENABLED`).
+  Когда включён, он выполняет **произвольную** git-подкоманду
   (`create_subprocess_exec`, не через shell — классическая инъекция вида
   `; rm -rf /` через аргумент невозможна), включая потенциально разрушительные
   (`push --force`, `reset --hard`). Сам по себе инструмент не проверяет,
@@ -168,6 +202,45 @@ MCP-инструмента). Остальные перечисленные ин�
 Перед деплоем: `pip install -r requirements.txt` в окружении с доступом к
 PyPI и `python -m unittest discover -s tests` — тогда пропущенные здесь
 тесты (`test_scheduler.py`, `test_api.py`) тоже выполнятся.
+
+**Урок на будущее (зафиксирован здесь намеренно):** именно из-за того, что
+`test_api.py` не выполнялся в песочнице, где писался этот код, два
+реальных бага в монтировании `/mcp` (см. «Устранение неполадок» ниже)
+обнаружились только при первом живом запуске у пользователя, а не тестами.
+`tests/test_api.py::McpEndpointTests` — тест именно на этот случай
+(реальный HTTP-запрос к `/mcp`, а не только к `/api/*`), добавлен когда
+баг уже был найден и исправлен; при доступном `fastapi` обязательно
+прогонять его вместе с остальными.
+
+## Устранение неполадок
+
+**`AgentsCore` пишет в лог `MCP list_tools недоступен: MCP-сервер ответил
+404` при любом значении `MCP_SERVER_URL`** (и с `/mcp` на конце, и без) —
+это была ошибка на стороне САМОГО mcp_server (уже исправлена в этой
+версии), а не в настройке AgentsCore. Причина — двойное монтирование:
+`mcp.server.fastmcp.FastMCP.streamable_http_app()` по умолчанию сама
+регистрирует единственный маршрут под `/mcp` (внутри Starlette-приложения,
+которое она возвращает), а `mcp_server/app.py` монтировал результат ЕЩЁ
+РАЗ под внешним префиксом `/mcp` — реально отвечающий путь получался
+`/mcp/mcp`, а сам `/mcp` отвечал `404 Not Found`. Исправлено монтированием
+под корнем (`app.mount("/", ...)` вместо `app.mount("/mcp", ...)`) — так
+внутренний маршрут `/mcp` остаётся единственным и ничем не задваивается.
+Если после обновления `mcp_server` до этой версии `404` всё ещё
+воспроизводится — проверьте, что запущен именно обновлённый код
+(`python -m mcp_server` из этого архива), а не старая версия.
+
+**После исправления 404 запрос к `/mcp` мог бы вместо этого падать с
+`RuntimeError: Task group is not initialized. Make sure to use run()`** —
+второй, независимый баг (тоже уже исправлен): у Starlette-приложения,
+смонтированного через `app.mount(...)`, собственный lifespan НЕ
+запускается автоматически (ASGI lifespan-события доставляются только
+приложению верхнего уровня) — а `streamable_http_app()` требует, чтобы
+именно её lifespan (`session_manager.run()`) был запущен, иначе она не
+может обработать вообще ни одного запроса. Исправлено явным объединением
+lifespan'ов в `create_app_with_store` (`contextlib.AsyncExitStack`,
+`mcp.session_manager.run()`) — приём из докстринга самого
+`FastMCP.session_manager`, официально рассчитанного как раз на
+монтирование FastMCP внутри стороннего ASGI-приложения.
 
 ## Структура
 

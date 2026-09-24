@@ -17,7 +17,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, Request
 from mcp.server.fastmcp import FastMCP
 
-from .deps import get_mcp, get_scheduler, get_store
+from .deps import get_features, get_mcp, get_scheduler, get_store, require_scheduling
+from .features import Features
 from .git_hosts import SUPPORTED_HOSTS, get_provider
 from .models import ACTION_KINDS
 from .scheduler import SchedulerService
@@ -39,6 +40,11 @@ router = APIRouter(prefix="/api", tags=["mcp"])
 #: расписание через `register_scheduled_tool`/`POST /api/scheduled-tools`
 #: (остальные MCP-инструменты сервера — одноразовые вызовы, не для
 #: расписания, см. докстринг `list_available_tools` ниже).
+_ACTION_TITLES = {
+    "git_pull": "Обновление локального репозитория",
+    "http_fetch": "HTTP-запрос",
+    "git_host_poll": "Опрос Git-хостинга",
+}
 _ACTION_DESCRIPTIONS = {
     "git_pull": "Обновить локальную рабочую копию git-репозитория (git pull).",
     "http_fetch": "Выполнить произвольный HTTP-запрос по расписанию.",
@@ -89,26 +95,31 @@ _ACTION_PARAMETER_SCHEMAS = {
 }
 
 
-async def list_available_tools(mcp: FastMCP) -> List[ToolDescriptionOut]:
+async def list_available_tools(mcp: FastMCP, features: Optional[Features] = None) -> List[ToolDescriptionOut]:
     """`schedulable=True` — только сами `action` (см. `_ACTION_*` выше);
     остальные MCP-инструменты сервера (`execute_git_command`, `save_result`,
     `git_host_get_repo`/`get_file`, `list_scheduled_tools`,
     `cancel_scheduled_tool`, `register_scheduled_tool` — введён отдельным
     REST-эндпоинтом, а не через список инструментов) — одноразовые вызовы
     для модели через AgentsCore, не заводятся на расписание."""
+    # Виды задач — только включённые настройками (см. `features.py`): без
+    # MCP_SCHEDULER_ENABLED их нет вовсе, без MCP_LOCAL_GIT_ENABLED нет
+    # git_pull. MCP-инструменты ниже уже отфильтрованы при регистрации
+    # (`build_mcp_server`).
+    features = features if features is not None else Features.from_config()
     items = [
         ToolDescriptionOut(
-            name=action, description=_ACTION_DESCRIPTIONS[action],
+            name=action, title=_ACTION_TITLES[action], description=_ACTION_DESCRIPTIONS[action],
             parameters=_ACTION_PARAMETER_SCHEMAS[action], schedulable=True,
         )
-        for action in ACTION_KINDS
+        for action in features.action_kinds
     ]
     mcp_tools = await mcp.list_tools()
     for tool in mcp_tools:
         if tool.name == "register_scheduled_tool":
             continue  # заведение задачи — отдельный REST-эндпоинт (POST /api/scheduled-tools)
         items.append(ToolDescriptionOut(
-            name=tool.name, description=tool.description or "",
+            name=tool.name, title=tool.title or "", description=tool.description or "",
             parameters=tool.inputSchema or {}, schedulable=False,
         ))
     return items
@@ -133,27 +144,31 @@ def _run_out(run) -> ScheduledToolRunOut:
 @router.get("/status", response_model=StatusOut)
 async def get_status(
     store: SchedulerStore = Depends(get_store), scheduler: Optional[SchedulerService] = Depends(get_scheduler),
-    mcp: FastMCP = Depends(get_mcp),
+    mcp: FastMCP = Depends(get_mcp), features: Features = Depends(get_features),
 ) -> StatusOut:
     tools = await mcp.list_tools()
     return StatusOut(
         scheduler_running=bool(scheduler and scheduler.running),
         tool_count=len(tools),
-        scheduled_count=len(store.list_tools(enabled=True)),
+        scheduled_count=len(store.list_tools(enabled=True)) if features.scheduling else 0,
+        scheduling_enabled=features.scheduling,
+        local_git_enabled=features.local_git,
     )
 
 
 @router.get("/tools", response_model=List[ToolDescriptionOut])
-async def get_tools(mcp: FastMCP = Depends(get_mcp)) -> List[ToolDescriptionOut]:
-    return await list_available_tools(mcp)
+async def get_tools(
+    mcp: FastMCP = Depends(get_mcp), features: Features = Depends(get_features),
+) -> List[ToolDescriptionOut]:
+    return await list_available_tools(mcp, features)
 
 
-@router.get("/scheduled-tools", response_model=List[ScheduledToolOut])
+@router.get("/scheduled-tools", response_model=List[ScheduledToolOut], dependencies=[Depends(require_scheduling)])
 def list_scheduled_tools_route(store: SchedulerStore = Depends(get_store)) -> List[ScheduledToolOut]:
     return [_tool_out(t) for t in store.list_tools()]
 
 
-@router.post("/scheduled-tools", response_model=ScheduledToolOut, status_code=201)
+@router.post("/scheduled-tools", response_model=ScheduledToolOut, status_code=201, dependencies=[Depends(require_scheduling)])
 def create_scheduled_tool_route(
     payload: ScheduledToolCreate, store: SchedulerStore = Depends(get_store),
     scheduler: Optional[SchedulerService] = Depends(get_scheduler),
@@ -167,7 +182,7 @@ def create_scheduled_tool_route(
     return _tool_out(tool)
 
 
-@router.patch("/scheduled-tools/{tool_id}", response_model=ScheduledToolOut)
+@router.patch("/scheduled-tools/{tool_id}", response_model=ScheduledToolOut, dependencies=[Depends(require_scheduling)])
 def update_scheduled_tool_route(
     tool_id: str, payload: ScheduledToolPatch, store: SchedulerStore = Depends(get_store),
     scheduler: Optional[SchedulerService] = Depends(get_scheduler),
@@ -179,7 +194,7 @@ def update_scheduled_tool_route(
     return _tool_out(tool)
 
 
-@router.delete("/scheduled-tools/{tool_id}", status_code=204)
+@router.delete("/scheduled-tools/{tool_id}", status_code=204, dependencies=[Depends(require_scheduling)])
 def delete_scheduled_tool_route(
     tool_id: str, store: SchedulerStore = Depends(get_store),
     scheduler: Optional[SchedulerService] = Depends(get_scheduler),
@@ -189,7 +204,7 @@ def delete_scheduled_tool_route(
         scheduler.remove_job(tool_id)
 
 
-@router.get("/scheduled-tools/{tool_id}/runs", response_model=List[ScheduledToolRunOut])
+@router.get("/scheduled-tools/{tool_id}/runs", response_model=List[ScheduledToolRunOut], dependencies=[Depends(require_scheduling)])
 def list_runs_route(
     tool_id: str, limit: int = Query(50, ge=1, le=500), store: SchedulerStore = Depends(get_store),
 ) -> List[ScheduledToolRunOut]:

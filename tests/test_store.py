@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +55,32 @@ class RegisterToolTests(unittest.TestCase):
         reloaded = self.store.get_tool(tool.id)
         self.assertEqual(reloaded.params, {"url": "https://example.com"})
         self.assertEqual(reloaded.input_schema, {"type": "object"})
+
+
+class AllowedActionsTests(unittest.TestCase):
+    """Виды задач, выключенные настройками сервера (см. `features.py`), не
+    заводятся: без локального Git нет git_pull, без планировщика — ничего."""
+
+    def _store(self, allowed):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.addCleanup(lambda: os.unlink(tmp.name))
+        return SchedulerStore(Database(tmp.name), allowed_actions=allowed)
+
+    def test_git_pull_rejected_when_not_allowed(self):
+        store = self._store(["http_fetch", "git_host_poll"])
+        with self.assertRaises(ValidationError) as ctx:
+            store.register_tool("Pull", "git_pull", "every:5m", params={"repo_path": "/tmp"})
+        self.assertIn("выключено", str(ctx.exception))
+
+    def test_allowed_action_still_registers(self):
+        store = self._store(["http_fetch"])
+        tool = store.register_tool("Fetch", "http_fetch", "every:5m", params={"url": "https://a"})
+        self.assertEqual(tool.action, "http_fetch")
+
+    def test_default_allows_all_action_kinds(self):
+        store = self._store(None)
+        store.register_tool("Pull", "git_pull", "every:5m", params={"repo_path": "/tmp"})
 
 
 class GetListDeleteTests(unittest.TestCase):

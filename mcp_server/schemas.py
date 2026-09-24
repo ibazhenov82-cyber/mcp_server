@@ -19,6 +19,8 @@ class StatusOut(BaseModel):
     scheduler_running: bool
     tool_count: int
     scheduled_count: int = Field(..., description="Число ВКЛЮЧЁННЫХ периодических задач")
+    scheduling_enabled: bool = Field(True, description="Включены ли периодические задачи (MCP_SCHEDULER_ENABLED)")
+    local_git_enabled: bool = Field(True, description="Включена ли работа с локальным Git (MCP_LOCAL_GIT_ENABLED)")
 
 
 class ToolDescriptionOut(BaseModel):
@@ -27,6 +29,7 @@ class ToolDescriptionOut(BaseModel):
     `schedulable`)."""
 
     name: str
+    title: str = Field("", description="Краткое русское описание для интерфейса (например, «Получение информации о репозитории»)")
     description: str
     parameters: Dict[str, Any] = Field(default_factory=dict, description="JSON Schema параметров")
     schedulable: bool = Field(..., description="Можно ли завести на него периодическую задачу (action)")

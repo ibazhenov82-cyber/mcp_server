@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Union
 from mcp.server.fastmcp import FastMCP
 
 from .actions import ActionError, execute_action, run_git_command
+from .features import Features
 from .git_hosts import GitHostError, SUPPORTED_HOSTS, get_provider
 from .models import ScheduledTool
 from .scheduler import SchedulerService
@@ -45,8 +46,14 @@ def _tool_to_dict(tool: ScheduledTool) -> Dict[str, Any]:
     }
 
 
-def build_mcp_server(store: SchedulerStore, scheduler: Optional[SchedulerService] = None) -> FastMCP:
-    """`scheduler` необязателен (например, в тестах, где реальный
+def build_mcp_server(
+    store: SchedulerStore, scheduler: Optional[SchedulerService] = None, features: Optional[Features] = None,
+) -> FastMCP:
+    """`features` — какие включаемые группы инструментов регистрировать (см.
+    `features.py`); по умолчанию — согласно настройкам `MCPConfig`
+    (`MCP_LOCAL_GIT_ENABLED`/`MCP_SCHEDULER_ENABLED`).
+
+    `scheduler` необязателен (например, в тестах, где реальный
     `AsyncIOScheduler` недоступен, см. `tests/test_server_tools.py`) — без
     него зарегистрированная задача попадёт в БД и будет подхвачена при
     следующем запуске процесса с планировщиком, просто не встанет "на лету"
@@ -57,63 +64,84 @@ def build_mcp_server(store: SchedulerStore, scheduler: Optional[SchedulerService
     # `agents_core.mcp_client.MCPClient`: обычный синхронный POST на запрос,
     # без долгоживущего соединения). `json_response=True` — сервер отвечает
     # обычным JSON, а не SSE-потоком.
+    #
+    # `streamable_http_path` НЕ переопределяется — оставлен по умолчанию
+    # ("/mcp"). См. `app.py` — там это Starlette-приложение монтируется под
+    # корнем (`app.mount("/", ...)`, а не `app.mount("/mcp", ...)`) именно
+    # для того, чтобы путь не задваивался (`/mcp/mcp`) и не требовал
+    # редиректа с "/mcp" на "/mcp/".
+    features = features if features is not None else Features.from_config()
     mcp = FastMCP("mcp-server", stateless_http=True, json_response=True)
 
-    @mcp.tool()
-    async def register_scheduled_tool(
-        name: str, schedule: str, action: str, params: Optional[Dict[str, Any]] = None,
-        description: str = "", input_schema: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Регистрирует новую периодическую задачу. `schedule` —
-        'every:<N><s|m|h>' | 'daily:HH:MM' | 5-полевой cron. `action` —
-        'git_pull' | 'http_fetch' | 'git_host_poll'."""
-        try:
-            tool = store.register_tool(
-                name, action, schedule, description=description, params=params or {}, input_schema=input_schema,
-            )
-        except _EXPECTED_ERRORS as exc:
-            return {"error": str(exc)}
-        if scheduler is not None:
-            scheduler.sync_job(tool)
-        return _tool_to_dict(tool)
+    # Периодические задачи — только при MCP_SCHEDULER_ENABLED (см.
+    # `features.py`): без этой настройки инструменты не регистрируются
+    # вовсе, а значит не попадают ни в `tools/list` (AgentsCore), ни в
+    # `/api/tools` (AgentsApp).
+    if features.scheduling:
+        action_list = " | ".join(f"'{a}'" for a in features.action_kinds)
 
-    @mcp.tool()
-    async def list_scheduled_tools(status: Optional[str] = None) -> List[Dict[str, Any]]:
-        """`status` — 'enabled' | 'disabled' | не задан (все)."""
-        enabled = {"enabled": True, "disabled": False}.get(status) if status else None
-        return [_tool_to_dict(t) for t in store.list_tools(enabled=enabled)]
+        @mcp.tool(
+            title="Создание периодической задачи",
+            description=(
+                "Регистрирует новую периодическую задачу. `schedule` — "
+                "'every:<N><s|m|h>' | 'daily:HH:MM' | 5-полевой cron. "
+                f"`action` — {action_list}."
+            ),
+        )
+        async def register_scheduled_tool(
+            name: str, schedule: str, action: str, params: Optional[Dict[str, Any]] = None,
+            description: str = "", input_schema: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            try:
+                tool = store.register_tool(
+                    name, action, schedule, description=description, params=params or {}, input_schema=input_schema,
+                )
+            except _EXPECTED_ERRORS as exc:
+                return {"error": str(exc)}
+            if scheduler is not None:
+                scheduler.sync_job(tool)
+            return _tool_to_dict(tool)
 
-    @mcp.tool()
-    async def cancel_scheduled_tool(task_id: str) -> Dict[str, Any]:
-        try:
-            store.delete_tool(task_id)
-        except _EXPECTED_ERRORS as exc:
-            return {"error": str(exc)}
-        if scheduler is not None:
-            scheduler.remove_job(task_id)
-        return {"task_id": task_id, "cancelled": True}
+        @mcp.tool(title="Список периодических задач")
+        async def list_scheduled_tools(status: Optional[str] = None) -> List[Dict[str, Any]]:
+            """`status` — 'enabled' | 'disabled' | не задан (все)."""
+            enabled = {"enabled": True, "disabled": False}.get(status) if status else None
+            return [_tool_to_dict(t) for t in store.list_tools(enabled=enabled)]
 
-    @mcp.tool()
-    async def execute_git_command(repo_path: str, command: str, args: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Выполняет произвольную git-команду над локальной рабочей копией
-        (`git -C repo_path <command> <args...>`) — НЕ через shell, но сама
-        команда всё равно мощная (см. предупреждение о безопасности в
-        README)."""
-        try:
-            return await run_git_command(repo_path, command, args)
-        except _EXPECTED_ERRORS as exc:
-            return {"error": str(exc)}
+        @mcp.tool(title="Удаление периодической задачи")
+        async def cancel_scheduled_tool(task_id: str) -> Dict[str, Any]:
+            try:
+                store.delete_tool(task_id)
+            except _EXPECTED_ERRORS as exc:
+                return {"error": str(exc)}
+            if scheduler is not None:
+                scheduler.remove_job(task_id)
+            return {"task_id": task_id, "cancelled": True}
 
-    @mcp.tool()
-    async def save_result(task_id: str, data: Any) -> Dict[str, Any]:
-        """Сохраняет `data` как результат ПОСЛЕДНЕГО запуска периодической
-        задачи `task_id` (см. `SchedulerStore.run_result`) — используется,
-        когда данные для задачи посчитаны отдельно от обычного цикла
-        планировщика."""
-        try:
-            return store.run_result(task_id, data)
-        except _EXPECTED_ERRORS as exc:
-            return {"error": str(exc)}
+        @mcp.tool(title="Сохранение результата задачи")
+        async def save_result(task_id: str, data: Any) -> Dict[str, Any]:
+            """Сохраняет `data` как результат ПОСЛЕДНЕГО запуска периодической
+            задачи `task_id` (см. `SchedulerStore.run_result`) — используется,
+            когда данные для задачи посчитаны отдельно от обычного цикла
+            планировщика."""
+            try:
+                return store.run_result(task_id, data)
+            except _EXPECTED_ERRORS as exc:
+                return {"error": str(exc)}
+
+    # Локальный Git — только при MCP_LOCAL_GIT_ENABLED (см. `features.py`).
+    if features.local_git:
+
+        @mcp.tool(title="Выполнение git-команды в локальном репозитории")
+        async def execute_git_command(repo_path: str, command: str, args: Optional[List[str]] = None) -> Dict[str, Any]:
+            """Выполняет произвольную git-команду над локальной рабочей копией
+            (`git -C repo_path <command> <args...>`) — НЕ через shell, но сама
+            команда всё равно мощная (см. предупреждение о безопасности в
+            README)."""
+            try:
+                return await run_git_command(repo_path, command, args)
+            except _EXPECTED_ERRORS as exc:
+                return {"error": str(exc)}
 
     async def _git_host_call(host: str, coro_factory) -> GitHostResult:
         if host not in SUPPORTED_HOSTS:
@@ -124,7 +152,7 @@ def build_mcp_server(store: SchedulerStore, scheduler: Optional[SchedulerService
         except _EXPECTED_ERRORS as exc:
             return {"error": str(exc)}
 
-    @mcp.tool()
+    @mcp.tool(title="Получение списка коммитов")
     async def git_host_list_commits(
         host: str, owner: str, repo: str, since: Optional[str] = None, until: Optional[str] = None,
         branch: Optional[str] = None, limit: int = 50,
@@ -133,29 +161,29 @@ def build_mcp_server(store: SchedulerStore, scheduler: Optional[SchedulerService
         либо относительное значение вида '-1h'/'-1d'."""
         return await _git_host_call(host, lambda p: p.list_commits(owner, repo, since=since, until=until, branch=branch, limit=limit))
 
-    @mcp.tool()
+    @mcp.tool(title="Получение списка pull request'ов")
     async def git_host_list_pull_requests(
         host: str, owner: str, repo: str, state: str = "all", since: Optional[str] = None, limit: int = 50,
     ) -> GitHostResult:
         """`state` — 'open' | 'closed' | 'all'."""
         return await _git_host_call(host, lambda p: p.list_pull_requests(owner, repo, state=state, since=since, limit=limit))
 
-    @mcp.tool()
+    @mcp.tool(title="Получение списка issues")
     async def git_host_list_issues(
         host: str, owner: str, repo: str, state: str = "all", since: Optional[str] = None, limit: int = 50,
     ) -> GitHostResult:
         """`state` — 'open' | 'closed' | 'all'."""
         return await _git_host_call(host, lambda p: p.list_issues(owner, repo, state=state, since=since, limit=limit))
 
-    @mcp.tool()
+    @mcp.tool(title="Получение списка релизов")
     async def git_host_list_releases(host: str, owner: str, repo: str, limit: int = 20) -> GitHostResult:
         return await _git_host_call(host, lambda p: p.list_releases(owner, repo, limit=limit))
 
-    @mcp.tool()
+    @mcp.tool(title="Получение информации о репозитории")
     async def git_host_get_repo(host: str, owner: str, repo: str) -> GitHostResult:
         return await _git_host_call(host, lambda p: p.get_repo(owner, repo))
 
-    @mcp.tool()
+    @mcp.tool(title="Получение файла из репозитория")
     async def git_host_get_file(host: str, owner: str, repo: str, path: str, ref: Optional[str] = None) -> GitHostResult:
         return await _git_host_call(host, lambda p: p.get_file(owner, repo, path, ref=ref))
 

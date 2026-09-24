@@ -38,8 +38,21 @@ def _load_dotenv(path: str = ".env") -> None:
 _load_dotenv()
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "да")
+
+
 class MCPConfig:
     """Читается один раз при импорте модуля."""
+
+    # --- Включаемые возможности (см. `features.py`) -------------------------
+    # Не заданы -> выключены: инструменты группы не попадают в список
+    # доступных ни AgentsCore (MCP tools/list), ни AgentsApp (/api/tools).
+    LOCAL_GIT_ENABLED: bool = _bool_env("MCP_LOCAL_GIT_ENABLED")
+    SCHEDULER_ENABLED: bool = _bool_env("MCP_SCHEDULER_ENABLED")
 
     HOST: str = os.environ.get("MCP_HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("MCP_PORT", "8001"))

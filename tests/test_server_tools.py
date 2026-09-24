@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from mcp_server.db import Database
+from mcp_server.features import Features
 from mcp_server.server import build_mcp_server
 from mcp_server.store import SchedulerStore
 
@@ -26,16 +27,94 @@ def _tool_text(result) -> dict:
     return structured.get("result", structured)
 
 
+#: Все включаемые группы инструментов (MCP_LOCAL_GIT_ENABLED и
+#: MCP_SCHEDULER_ENABLED) — для тестов самих инструментов; выключенные
+#: варианты проверяет `FeatureGatingTests` ниже.
+ALL = Features.all_enabled()
+
+
 def make_store() -> SchedulerStore:
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     return SchedulerStore(Database(tmp.name))
 
 
+class ToolTitlesTests(unittest.IsolatedAsyncioTestCase):
+    """Каждый инструмент обязан иметь краткое русское описание (`title`) —
+    его показывают AgentsApp (выбор инструментов в настройках, экран MCP) и
+    строка «Использую инструмент …» в ленте чата."""
+
+    async def test_every_tool_has_russian_title(self):
+        store = make_store()
+        try:
+            tools = await build_mcp_server(store, features=ALL).list_tools()
+        finally:
+            Path(store._db.path).unlink(missing_ok=True)
+        self.assertTrue(tools)
+        for tool in tools:
+            self.assertTrue(tool.title, f"нет title у {tool.name}")
+            self.assertRegex(tool.title, "[А-Яа-яЁё]", f"title у {tool.name} не на русском")
+
+
+class FeatureGatingTests(unittest.IsolatedAsyncioTestCase):
+    """По замечанию пользователя: без соответствующей настройки инструменты
+    локального Git и периодических задач не попадают в список доступных."""
+
+    SCHEDULING = {"register_scheduled_tool", "list_scheduled_tools", "cancel_scheduled_tool", "save_result"}
+    LOCAL_GIT = {"execute_git_command"}
+
+    async def _names(self, features: Features) -> set:
+        store = make_store()
+        try:
+            return {t.name for t in await build_mcp_server(store, features=features).list_tools()}
+        finally:
+            Path(store._db.path).unlink(missing_ok=True)
+
+    async def test_nothing_enabled_leaves_only_git_host_tools(self):
+        names = await self._names(Features())
+        self.assertFalse(names & (self.SCHEDULING | self.LOCAL_GIT))
+        self.assertTrue(names)
+        self.assertTrue(all(n.startswith("git_host_") for n in names))
+
+    async def test_local_git_only(self):
+        names = await self._names(Features(local_git=True))
+        self.assertTrue(self.LOCAL_GIT <= names)
+        self.assertFalse(names & self.SCHEDULING)
+
+    async def test_scheduling_only(self):
+        names = await self._names(Features(scheduling=True))
+        self.assertTrue(self.SCHEDULING <= names)
+        self.assertFalse(names & self.LOCAL_GIT)
+
+    async def test_all_enabled(self):
+        names = await self._names(ALL)
+        self.assertTrue((self.SCHEDULING | self.LOCAL_GIT) <= names)
+
+    def test_action_kinds_follow_features(self):
+        self.assertEqual(Features().action_kinds, [])
+        self.assertEqual(Features(local_git=True).action_kinds, [])
+        self.assertNotIn("git_pull", Features(scheduling=True).action_kinds)
+        self.assertIn("git_pull", ALL.action_kinds)
+
+    async def test_register_git_pull_rejected_without_local_git(self):
+        features = Features(scheduling=True)
+        store = SchedulerStore(Database(tempfile.NamedTemporaryFile(suffix=".db", delete=False).name),
+                               allowed_actions=features.action_kinds)
+        try:
+            mcp = build_mcp_server(store, features=features)
+            result = _tool_text(await mcp.call_tool("register_scheduled_tool", {
+                "name": "pull", "schedule": "every:1h", "action": "git_pull", "params": {"repo_path": "/tmp"},
+            }))
+            self.assertIn("error", result)
+            self.assertEqual(store.list_tools(), [])
+        finally:
+            Path(store._db.path).unlink(missing_ok=True)
+
+
 class RegisterListCancelToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.store = make_store()
-        self.mcp = build_mcp_server(self.store)
+        self.mcp = build_mcp_server(self.store, features=ALL)
 
     def tearDown(self) -> None:
         Path(self.store._db.path).unlink(missing_ok=True)
@@ -83,7 +162,7 @@ class RegisterListCancelToolTests(unittest.IsolatedAsyncioTestCase):
 class SaveResultToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.store = make_store()
-        self.mcp = build_mcp_server(self.store)
+        self.mcp = build_mcp_server(self.store, features=ALL)
 
     def tearDown(self) -> None:
         Path(self.store._db.path).unlink(missing_ok=True)
@@ -103,7 +182,7 @@ class SaveResultToolTests(unittest.IsolatedAsyncioTestCase):
 class ExecuteGitCommandToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.store = make_store()
-        self.mcp = build_mcp_server(self.store)
+        self.mcp = build_mcp_server(self.store, features=ALL)
         self._tmpdir = tempfile.TemporaryDirectory()
         self.repo_path = self._tmpdir.name
         subprocess.run(["git", "init"], cwd=self.repo_path, check=True, capture_output=True)
@@ -130,7 +209,7 @@ class ExecuteGitCommandToolTests(unittest.IsolatedAsyncioTestCase):
 class GitHostToolsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.store = make_store()
-        self.mcp = build_mcp_server(self.store)
+        self.mcp = build_mcp_server(self.store, features=ALL)
 
     def tearDown(self) -> None:
         Path(self.store._db.path).unlink(missing_ok=True)

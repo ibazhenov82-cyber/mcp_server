@@ -4,7 +4,14 @@
 # установки, поэтому итоговый список ниже не проверялся `pip install`
 # в этом окружении — проверьте при первом деплое).
 
-mcp[cli]>=1.2.0        # MCP SDK: FastMCP, Streamable HTTP транспорт
+# ВАЖНО: жёстко закреплено < 2 — весь код этого пакета (server.py, api.py)
+# написан против API mcp 1.x (`from mcp.server.fastmcp import FastMCP`).
+# В mcp 2.x FastMCP переименован в MCPServer и переехал в
+# `mcp.server.mcpserver` (несовместимое изменение API), поэтому
+# `pip install -r requirements.txt` без этого ограничения версии на
+# свежем окружении ставит 2.x и сервер не запускается с
+# `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`.
+mcp[cli]>=1.2.0,<2      # MCP SDK: FastMCP, Streamable HTTP транспорт
 apscheduler>=3.10       # AsyncIOScheduler для периодических задач
 httpx>=0.27             # HTTP-клиент: git-хостинги, action=http_fetch
 fastapi>=0.110          # REST API (/api/*) + монтирование streamable_http_app()

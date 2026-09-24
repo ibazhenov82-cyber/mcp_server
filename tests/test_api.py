@@ -28,6 +28,8 @@ from mcp_server.store import SchedulerStore
 if FASTAPI_AVAILABLE:
     from mcp_server.app import create_app_with_store
 
+from mcp_server.features import Features
+
 
 @unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi не установлен в этом окружении")
 class ApiTestCase(unittest.TestCase):
@@ -35,7 +37,7 @@ class ApiTestCase(unittest.TestCase):
         fd, self.db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         self.store = SchedulerStore(Database(self.db_path))
-        app = create_app_with_store(self.store, start_scheduler=False)
+        app = create_app_with_store(self.store, start_scheduler=False, features=Features.all_enabled())
         self.client = TestClient(app)
 
     def tearDown(self) -> None:
@@ -122,6 +124,111 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(set(hosts), {"github", "gitlab", "gitea"})
         for entry in hosts.values():
             self.assertFalse(entry["configured"])
+
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi не установлен в этом окружении")
+class McpEndpointTests(unittest.TestCase):
+    """Реальный сквозной запрос к `/mcp` (не `/api/*`) — регрессия на два
+    бага, найденных на практике при первом живом запуске сервиса и не
+    пойманных остальными тестами этого файла именно потому, что там
+    `TestClient` создаётся БЕЗ `with` (см. `ApiTestCase.setUp`), а без
+    входа в контекстный менеджер ASGI lifespan вообще не запускается:
+
+    1. `mcp_asgi_app` (Starlette-приложение из `streamable_http_app()`)
+       раньше монтировалось ВТОРОЙ РАЗ под `/mcp` поверх уже
+       зарегистрированного там же внутреннего маршрута FastMCP — реальный
+       путь был `/mcp/mcp`, а `/mcp` отвечал 404.
+    2. Даже после исправления пути — у смонтированного `Mount(...)`
+       Starlette НЕ запускает автоматически lifespan своего под-приложения,
+       а `session_manager.run()` (заводит task group) обязателен для
+       обработки любого запроса, иначе `RuntimeError: Task group is not
+       initialized`.
+
+    Оба бага воспроизводятся только при РЕАЛЬНОМ HTTP-запросе к `/mcp` с
+    запущенным lifespan — отсюда обязательный `with TestClient(app) as client:`
+    ниже, в отличие от остальных тестов файла."""
+
+    def setUp(self) -> None:
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = SchedulerStore(Database(self.db_path))
+        self.app = create_app_with_store(self.store, start_scheduler=False, features=Features.all_enabled())
+
+    def tearDown(self) -> None:
+        try:
+            os.unlink(self.db_path)
+        except OSError:
+            pass
+
+    def test_tools_list_via_real_mcp_endpoint(self):
+        with TestClient(self.app, base_url="http://localhost:8001") as client:
+            resp = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            names = {t["name"] for t in resp.json()["result"]["tools"]}
+            self.assertIn("register_scheduled_tool", names)
+            self.assertIn("list_scheduled_tools", names)
+
+    def test_call_tool_via_real_mcp_endpoint(self):
+        with TestClient(self.app, base_url="http://localhost:8001") as client:
+            resp = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "list_scheduled_tools", "arguments": {}},
+                },
+                headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            body = resp.json()
+            self.assertFalse(body["result"]["isError"])
+            self.assertEqual(body["result"]["structuredContent"]["result"], [])
+
+    def test_root_mcp_mount_does_not_break_rest_api(self):
+        # Монтирование под "/" (см. app.py) не должно перехватывать /api/*,
+        # зарегистрированный через include_router ДО этого монтирования.
+        with TestClient(self.app, base_url="http://localhost:8001") as client:
+            resp = client.get("/api/status")
+            self.assertEqual(resp.status_code, 200)
+
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi не установлен в этом окружении")
+class DisabledFeaturesApiTests(unittest.TestCase):
+    """Без MCP_SCHEDULER_ENABLED/MCP_LOCAL_GIT_ENABLED: /api/tools не
+    содержит видов задач, /api/scheduled-tools* отвечают 409, /api/status
+    сообщает флаги (AgentsApp по ним прячет раздел задач)."""
+
+    def setUp(self) -> None:
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = SchedulerStore(Database(self.db_path), allowed_actions=[])
+        self.client = TestClient(create_app_with_store(self.store, start_scheduler=False, features=Features()))
+
+    def tearDown(self) -> None:
+        try:
+            os.unlink(self.db_path)
+        except OSError:
+            pass
+
+    def test_tools_list_has_no_schedulable_or_local_git(self):
+        names = {t["name"]: t for t in self.client.get("/api/tools").json()}
+        self.assertFalse(any(t["schedulable"] for t in names.values()))
+        self.assertNotIn("execute_git_command", names)
+        self.assertNotIn("list_scheduled_tools", names)
+        self.assertIn("git_host_get_repo", names)
+
+    def test_scheduled_tools_endpoints_return_409(self):
+        resp = self.client.get("/api/scheduled-tools")
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("error", resp.json())
+
+    def test_status_reports_flags(self):
+        body = self.client.get("/api/status").json()
+        self.assertFalse(body["scheduling_enabled"])
+        self.assertFalse(body["local_git_enabled"])
 
 
 if __name__ == "__main__":

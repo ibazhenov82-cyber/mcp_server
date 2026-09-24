@@ -95,6 +95,20 @@ class SchedulerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runs[0].status, "error")
         self.assertIn("boom", runs[0].error)
 
+    async def test_run_tool_skips_action_disabled_after_registration(self):
+        # git_pull заведён, пока локальный Git был включён; после выключения
+        # MCP_LOCAL_GIT_ENABLED задача не выполняется, причина — в истории.
+        tool = self.store.register_tool("Pull", "git_pull", "every:5m", params={"repo_path": "/tmp"})
+        self.store.allowed_actions = ["http_fetch", "git_host_poll"]
+        service = SchedulerService(self.store)
+        mock = AsyncMock(return_value={"ok": True})
+        with patch("mcp_server.scheduler.execute_action", mock):
+            await service._run_tool(tool.id)
+        mock.assert_not_called()
+        runs = self.store.list_runs(tool.id)
+        self.assertEqual(runs[0].status, "error")
+        self.assertIn("выключено", runs[0].error)
+
     async def test_run_tool_for_deleted_tool_is_a_noop(self):
         service = SchedulerService(self.store)
         await service._run_tool("nonexistent-id")  # не должно поднять исключение
