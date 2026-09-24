@@ -1,0 +1,15 @@
+# MCP-сервер — самостоятельный сервис, минимальный набор зависимостей
+# (см. README, "Ограничения окружения разработки": в песочнице, где
+# писался этот код, fastapi/apscheduler/pytest были недоступны для
+# установки, поэтому итоговый список ниже не проверялся `pip install`
+# в этом окружении — проверьте при первом деплое).
+
+mcp[cli]>=1.2.0        # MCP SDK: FastMCP, Streamable HTTP транспорт
+apscheduler>=3.10       # AsyncIOScheduler для периодических задач
+httpx>=0.27             # HTTP-клиент: git-хостинги, action=http_fetch
+fastapi>=0.110          # REST API (/api/*) + монтирование streamable_http_app()
+uvicorn>=0.29           # ASGI-сервер для __main__.py
+pydantic>=2.0           # схемы REST API (schemas.py)
+
+# Тесты
+pytest>=8.0
