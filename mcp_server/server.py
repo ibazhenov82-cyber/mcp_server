@@ -24,6 +24,7 @@ mcp_server.server
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 from typing import Any, Dict, List, Optional, Union
 
@@ -67,23 +68,35 @@ def _group(name: str) -> Dict[str, Any]:
     return {GROUP_META_KEY: name}
 
 
-#: `_meta` вызова от AgentsCore: из какого чата он пришёл.
+#: `_meta` вызова от AgentsCore: из какого чата он пришёл и какие
+#: инструменты этого сервера в чате разрешены.
 META_CHAT_ID = "agentscore/chat_id"
+META_ALLOWED_TOOLS = "agentscore/allowed_tools"
 
 #: Инструменты-источники, ответ которых можно сохранять и сравнивать.
 TRACKABLE_PREFIXES = ("git_host_list_",)
 TRACKABLE_TOOLS = {"duckduckgo_search"}
 
 
-def caller_chat_id(ctx: Optional[Context]) -> Optional[str]:
-    """Чат, из которого пришёл вызов (None — вызов не из чата AgentsCore)."""
+def _caller_meta(ctx: Optional[Context]) -> Dict[str, Any]:
     try:
         meta = ctx.request_context.meta if ctx is not None else None
     except (ValueError, LookupError, AttributeError):
-        return None
-    if meta is None:
-        return None
-    return meta.model_dump().get(META_CHAT_ID) or None
+        return {}
+    return meta.model_dump() if meta is not None else {}
+
+
+def caller_chat_id(ctx: Optional[Context]) -> Optional[str]:
+    """Чат, из которого пришёл вызов (None — вызов не из чата AgentsCore)."""
+    return _caller_meta(ctx).get(META_CHAT_ID) or None
+
+
+def caller_allowed_tools(ctx: Optional[Context]) -> Optional[set]:
+    """Инструменты, выбранные в чате (None — вызов не из чата: планировщик,
+    прямой вызов — ограничений нет). Через `run_pipeline` и
+    `save_tool_result` нельзя вызвать инструмент, не выбранный в чате."""
+    allowed = _caller_meta(ctx).get(META_ALLOWED_TOOLS)
+    return {str(n) for n in allowed} if isinstance(allowed, list) else None
 
 
 def _is_trackable(name: str) -> bool:
@@ -264,6 +277,7 @@ def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Option
             только при `overwrite=true`. Возвращает путь, размер и sha256."""
             return await _call(pipeline_tools.save_to_text_file(filename, result_id, content, overwrite))
 
+    save_tool_result_impl = None
     if features.files and pipeline_tools.files is not None:
         snapshots = SnapshotStore(str(pipeline_tools.files.root))
 
@@ -283,9 +297,19 @@ def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Option
             за обновлениями или сообщать только о новом. Пример: tool="git_host_list_commits",
             args={"host": "github", "owner": "octocat", "repo": "hello-world"}. `reset=true` —
             начать заново (забыть сохранённое). `max_items` — сколько элементов вернуть."""
+            return await save_tool_result_impl(
+                tool, args, reset, max_items, chat_id=caller_chat_id(ctx), allowed=caller_allowed_tools(ctx),
+            )
+
+        async def save_tool_result_impl(
+            tool: str, args: Optional[Dict[str, Any]] = None, reset: bool = False, max_items: int = 100,
+            *, chat_id: Optional[str] = None, allowed: Optional[set] = None,
+        ) -> Dict[str, Any]:
             if not _is_trackable(tool) or tool not in registry:
                 available = sorted(n for n in registry if _is_trackable(n))
                 return {"error": f"инструмент {tool!r} нельзя отслеживать; доступны: {available}"}
+            if allowed is not None and tool not in allowed:
+                return {"error": f"инструмент {tool!r} не выбран в настройках этого чата"}
             source = registry[tool]
             call_args = dict(args or {})
             try:
@@ -301,7 +325,6 @@ def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Option
             requested_limit = None
             if limit_arg:
                 requested_limit = call_args.get(limit_arg, params[limit_arg].default)
-            chat_id = caller_chat_id(ctx)
             result = await asyncio.to_thread(
                 snapshots.compare_and_save, chat_id or "shared", tool, call_args, items, reset,
                 requested_limit if isinstance(requested_limit, int) else None,
@@ -322,16 +345,27 @@ def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Option
             return result
 
     chain_tools = dict(registry)
+    tracking_impl = save_tool_result_impl
 
     @tool("Цепочка инструментов", GROUP_PIPELINES)
-    async def run_pipeline(steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def run_pipeline(steps: List[Dict[str, Any]], ctx: Optional[Context] = None) -> Dict[str, Any]:
         """Выполняет инструменты этого сервера по очереди за один вызов. Шаг —
         {"tool": "<имя>", "args": {...}}. В аргументах "$prev" — result_id предыдущего
         шага, "$prev.<поле>" — его поле, "$2" / "$2.<поле>" — шага 2. Останавливается на
         первой ошибке. Возвращает трассу шагов и проверки передачи данных между ними.
+        В цепочке можно использовать только инструменты, выбранные в этом чате. Ответ шага
+        без result_id (например, git_host_list_commits) сохраняется автоматически, так что
+        "$prev" работает для любого шага.
         Пример: [{"tool": "duckduckgo_search", "args": {"query": "..."}},
         {"tool": "summarize", "args": {"result_id": "$prev"}},
         {"tool": "save_to_text_file", "args": {"result_id": "$prev", "filename": "reports/{date}.md"}}]"""
-        return await _call(run_pipeline_impl(steps, chain_tools))
+        allowed = caller_allowed_tools(ctx)
+        tools = dict(chain_tools)
+        if tracking_impl is not None:
+            # Снимки — в папке этого чата, источник — только из разрешённых.
+            tools["save_tool_result"] = functools.partial(
+                tracking_impl, chat_id=caller_chat_id(ctx), allowed=allowed,
+            )
+        return await _call(run_pipeline_impl(steps, tools, allowed=allowed, store=pipeline_tools.store))
 
     return mcp
