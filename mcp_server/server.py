@@ -2,144 +2,159 @@
 mcp_server.server
 ====================
 
-`build_mcp_server()` — собирает `FastMCP` с инструментами из ТЗ. Вся
-бизнес-логика — в `store.py`/`actions.py`/`git_hosts/*`; функции здесь —
-тонкие обёртки: разбирают аргументы, вызывают нижний слой, ловят ожидаемые
-исключения и возвращают структурированный `{"error": ...}` вместо того,
-чтобы поднимать их наружу (FastMCP оборачивает необработанное исключение в
-`ToolError` с потерей структуры — модели гораздо полезнее плоский dict,
-который она может прочитать и решить, что делать дальше; см. аналогичное
-решение в `agents_core.repository.Repository._execute_tool_call`).
+`build_mcp_server()` собирает `FastMCP` с инструментами сервера. Функции
+здесь — тонкие обёртки: разбирают аргументы, вызывают `actions.py` или
+`git_hosts/*`, ловят ожидаемые ошибки и возвращают `{"error": ...}` вместо
+исключения — модели полезнее прочитать текст ошибки, чем получить
+оборванный вызов.
 
-Транспорт — ТОЛЬКО Streamable HTTP (см. `app.py`: `mcp.streamable_http_app()`
-монтируется в FastAPI-приложение); stdio не реализуем (ТЗ)."""
+Группы инструментов (передаются в `_meta["agentscore/group"]` каждого
+инструмента, см. `GROUP_*`):
+
+- «GIT API» — Git-хостинги (`git_host_*`), всегда;
+- «Локальный GIT» (`execute_git_command`, `git_pull`) — при `MCP_LOCAL_GIT_ENABLED`;
+- «HTTP-запросы» (`http_fetch`) — при `MCP_HTTP_FETCH_ENABLED`.
+
+Периодических задач здесь больше нет — они в отдельном сервисе
+планировщика (scheduler_service), который вызывает эти же инструменты по
+протоколу MCP.
+
+Транспорт — только Streamable HTTP (см. `app.py`)."""
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from typing import Any, Dict, List, Optional, Union
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
-from .actions import ActionError, execute_action, run_git_command
+from .actions import ActionError, git_pull as git_pull_action, http_fetch as http_fetch_action, run_git_command
+from .config import MCPConfig
 from .features import Features
+from .files import FileStore
 from .git_hosts import GitHostError, SUPPORTED_HOSTS, get_provider
-from .models import ScheduledTool
-from .scheduler import SchedulerService
-from .store import NotFoundError, SchedulerStore, ValidationError
+from .llm import LLMClient
+from .pipeline import PipelineError, run_pipeline as run_pipeline_impl
+from .pipeline_tools import PipelineTools, ToolError
+from .results import ResultNotFoundError, ResultStore
+from .snapshots import SnapshotError, SnapshotStore, extract_items
+from .web_pages import fetch_page
+from .web_search import make_ddgs_search
 
-_EXPECTED_ERRORS = (NotFoundError, ValidationError, ActionError, GitHostError, ValueError)
+_EXPECTED_ERRORS = (
+    ActionError, GitHostError, ValueError, ToolError, ResultNotFoundError, PipelineError, SnapshotError,
+)
 
-#: git_host_* инструменты возвращают либо список нормализованных элементов
-#: (коммиты/PR/issues/релизы), либо один dict (repo/file), либо
-#: {"error": ...} — конкретный (не голый `Any`) return-аннотация нужна,
-#: чтобы FastMCP построил structured output (`Any`/голый `list` без
-#: параметра — не строит, см. тесты `test_server_tools.py`).
+#: git_host_* возвращают список нормализованных элементов, один dict или
+#: {"error": ...} — конкретная аннотация нужна, чтобы FastMCP построил
+#: structured output.
 GitHostResult = Union[List[Dict[str, Any]], Dict[str, Any]]
 
+#: Ключ `_meta` инструмента с его группой — AgentsCore и приложение
+#: показывают её в списке инструментов вместо названия сервера.
+GROUP_META_KEY = "agentscore/group"
+GROUP_GIT_API = "GIT API"
+GROUP_LOCAL_GIT = "Локальный GIT"
+GROUP_HTTP = "HTTP-запросы"
+GROUP_WEB_SEARCH = "Интернет поиск"
+GROUP_LLM = "Обработка LLM"
+GROUP_FILES = "Работа с файлами"
+GROUP_PIPELINES = "Пайплайны"
 
-def _tool_to_dict(tool: ScheduledTool) -> Dict[str, Any]:
-    return {
-        "id": tool.id, "name": tool.name, "description": tool.description,
-        "action": tool.action, "schedule": tool.schedule, "params": tool.params,
-        "input_schema": tool.input_schema, "enabled": tool.enabled,
-        "created_at": tool.created_at, "last_run_at": tool.last_run_at, "next_run_at": tool.next_run_at,
-    }
+
+def _group(name: str) -> Dict[str, Any]:
+    return {GROUP_META_KEY: name}
 
 
-def build_mcp_server(
-    store: SchedulerStore, scheduler: Optional[SchedulerService] = None, features: Optional[Features] = None,
-) -> FastMCP:
-    """`features` — какие включаемые группы инструментов регистрировать (см.
-    `features.py`); по умолчанию — согласно настройкам `MCPConfig`
-    (`MCP_LOCAL_GIT_ENABLED`/`MCP_SCHEDULER_ENABLED`).
+#: `_meta` вызова от AgentsCore: из какого чата он пришёл.
+META_CHAT_ID = "agentscore/chat_id"
 
-    `scheduler` необязателен (например, в тестах, где реальный
-    `AsyncIOScheduler` недоступен, см. `tests/test_server_tools.py`) — без
-    него зарегистрированная задача попадёт в БД и будет подхвачена при
-    следующем запуске процесса с планировщиком, просто не встанет "на лету"
-    в уже работающий job store текущего процесса."""
-    # `stateless_http=True` — спецификация MCP 2026-07-28, требование ТЗ:
-    # никакого хендшейка `initialize`/сессии между вызовами, каждый HTTP-запрос
-    # самодостаточен (упрощает и AgentsCore как клиента — см.
-    # `agents_core.mcp_client.MCPClient`: обычный синхронный POST на запрос,
-    # без долгоживущего соединения). `json_response=True` — сервер отвечает
-    # обычным JSON, а не SSE-потоком.
-    #
-    # `streamable_http_path` НЕ переопределяется — оставлен по умолчанию
-    # ("/mcp"). См. `app.py` — там это Starlette-приложение монтируется под
-    # корнем (`app.mount("/", ...)`, а не `app.mount("/mcp", ...)`) именно
-    # для того, чтобы путь не задваивался (`/mcp/mcp`) и не требовал
-    # редиректа с "/mcp" на "/mcp/".
+#: Инструменты-источники, ответ которых можно сохранять и сравнивать.
+TRACKABLE_PREFIXES = ("git_host_list_",)
+TRACKABLE_TOOLS = {"duckduckgo_search"}
+
+
+def caller_chat_id(ctx: Optional[Context]) -> Optional[str]:
+    """Чат, из которого пришёл вызов (None — вызов не из чата AgentsCore)."""
+    try:
+        meta = ctx.request_context.meta if ctx is not None else None
+    except (ValueError, LookupError, AttributeError):
+        return None
+    if meta is None:
+        return None
+    return meta.model_dump().get(META_CHAT_ID) or None
+
+
+def _is_trackable(name: str) -> bool:
+    return name in TRACKABLE_TOOLS or name.startswith(TRACKABLE_PREFIXES)
+
+
+def build_pipeline_tools(features: Features) -> PipelineTools:
+    """Инструменты-звенья пайплайнов по настройкам `MCPConfig`."""
+    cfg = MCPConfig
+    return PipelineTools(
+        ResultStore(cfg.DATA_DIR, cfg.RESULT_TTL_HOURS),
+        search_fn=make_ddgs_search(cfg.DDGS_BACKEND, cfg.DDGS_TIMEOUT) if features.web_search else None,
+        region=cfg.DDGS_REGION,
+        llm=LLMClient(cfg.LLM_BASE_URL, cfg.LLM_API_KEY, cfg.LLM_MODEL, cfg.LLM_TIMEOUT, cfg.LLM_MAX_TOKENS)
+        if features.llm else None,
+        page_reader=lambda url: fetch_page(url, timeout=cfg.HTTP_TIMEOUT),
+        files=FileStore(cfg.FILES_DIR) if features.files else None,
+    )
+
+
+def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Optional[PipelineTools] = None) -> FastMCP:
+    """`features` — какие включаемые группы регистрировать; по умолчанию —
+    по настройкам `MCPConfig`. `pipeline_tools` — звенья пайплайнов (тесты
+    передают свои, с подменённым поиском и моделью)."""
     features = features if features is not None else Features.from_config()
+    pipeline_tools = pipeline_tools if pipeline_tools is not None else build_pipeline_tools(features)
+    # stateless_http — каждый HTTP-запрос самодостаточен (без сессии);
+    # json_response — обычный JSON вместо SSE. `streamable_http_path`
+    # оставлен по умолчанию ("/mcp"), приложение монтируется под корнем
+    # (см. app.py).
     mcp = FastMCP("mcp-server", stateless_http=True, json_response=True)
+    #: Имя -> функция инструмента: то, что может вызывать run_pipeline.
+    registry: Dict[str, Any] = {}
 
-    # Периодические задачи — только при MCP_SCHEDULER_ENABLED (см.
-    # `features.py`): без этой настройки инструменты не регистрируются
-    # вовсе, а значит не попадают ни в `tools/list` (AgentsCore), ни в
-    # `/api/tools` (AgentsApp).
-    if features.scheduling:
-        action_list = " | ".join(f"'{a}'" for a in features.action_kinds)
+    def tool(title: str, group: str):
+        def decorator(fn):
+            mcp.tool(title=title, meta=_group(group))(fn)
+            registry[fn.__name__] = fn
+            return fn
 
-        @mcp.tool(
-            title="Создание периодической задачи",
-            description=(
-                "Регистрирует новую периодическую задачу. `schedule` — "
-                "'every:<N><s|m|h>' | 'daily:HH:MM' | 5-полевой cron. "
-                f"`action` — {action_list}."
-            ),
-        )
-        async def register_scheduled_tool(
-            name: str, schedule: str, action: str, params: Optional[Dict[str, Any]] = None,
-            description: str = "", input_schema: Optional[Dict[str, Any]] = None,
-        ) -> Dict[str, Any]:
-            try:
-                tool = store.register_tool(
-                    name, action, schedule, description=description, params=params or {}, input_schema=input_schema,
-                )
-            except _EXPECTED_ERRORS as exc:
-                return {"error": str(exc)}
-            if scheduler is not None:
-                scheduler.sync_job(tool)
-            return _tool_to_dict(tool)
+        return decorator
 
-        @mcp.tool(title="Список периодических задач")
-        async def list_scheduled_tools(status: Optional[str] = None) -> List[Dict[str, Any]]:
-            """`status` — 'enabled' | 'disabled' | не задан (все)."""
-            enabled = {"enabled": True, "disabled": False}.get(status) if status else None
-            return [_tool_to_dict(t) for t in store.list_tools(enabled=enabled)]
-
-        @mcp.tool(title="Удаление периодической задачи")
-        async def cancel_scheduled_tool(task_id: str) -> Dict[str, Any]:
-            try:
-                store.delete_tool(task_id)
-            except _EXPECTED_ERRORS as exc:
-                return {"error": str(exc)}
-            if scheduler is not None:
-                scheduler.remove_job(task_id)
-            return {"task_id": task_id, "cancelled": True}
-
-        @mcp.tool(title="Сохранение результата задачи")
-        async def save_result(task_id: str, data: Any) -> Dict[str, Any]:
-            """Сохраняет `data` как результат ПОСЛЕДНЕГО запуска периодической
-            задачи `task_id` (см. `SchedulerStore.run_result`) — используется,
-            когда данные для задачи посчитаны отдельно от обычного цикла
-            планировщика."""
-            try:
-                return store.run_result(task_id, data)
-            except _EXPECTED_ERRORS as exc:
-                return {"error": str(exc)}
-
-    # Локальный Git — только при MCP_LOCAL_GIT_ENABLED (см. `features.py`).
     if features.local_git:
 
-        @mcp.tool(title="Выполнение git-команды в локальном репозитории")
+        @tool("Выполнение git-команды в локальном репозитории", GROUP_LOCAL_GIT)
         async def execute_git_command(repo_path: str, command: str, args: Optional[List[str]] = None) -> Dict[str, Any]:
-            """Выполняет произвольную git-команду над локальной рабочей копией
-            (`git -C repo_path <command> <args...>`) — НЕ через shell, но сама
-            команда всё равно мощная (см. предупреждение о безопасности в
-            README)."""
+            """Выполняет git-команду над локальной рабочей копией
+            (`git -C repo_path <command> <args...>`), не через shell."""
             try:
                 return await run_git_command(repo_path, command, args)
+            except _EXPECTED_ERRORS as exc:
+                return {"error": str(exc)}
+
+        @tool("Обновление локального репозитория", GROUP_LOCAL_GIT)
+        async def git_pull(repo_path: str, remote: str = "origin", branch: Optional[str] = None) -> Dict[str, Any]:
+            """`git pull` в локальной рабочей копии `repo_path`."""
+            try:
+                return await git_pull_action(repo_path, remote, branch)
+            except _EXPECTED_ERRORS as exc:
+                return {"error": str(exc)}
+
+    if features.http_fetch:
+
+        @tool("HTTP-запрос", GROUP_HTTP)
+        async def http_fetch(
+            url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None,
+            body: Optional[Dict[str, Any]] = None, timeout: float = 30,
+        ) -> Dict[str, Any]:
+            """HTTP-запрос с сервера: код ответа, заголовки и тело (обрезается до 5000 символов)."""
+            try:
+                return await http_fetch_action(url, method, headers, body, timeout)
             except _EXPECTED_ERRORS as exc:
                 return {"error": str(exc)}
 
@@ -152,7 +167,7 @@ def build_mcp_server(
         except _EXPECTED_ERRORS as exc:
             return {"error": str(exc)}
 
-    @mcp.tool(title="Получение списка коммитов")
+    @tool("Получение списка коммитов", GROUP_GIT_API)
     async def git_host_list_commits(
         host: str, owner: str, repo: str, since: Optional[str] = None, until: Optional[str] = None,
         branch: Optional[str] = None, limit: int = 50,
@@ -161,30 +176,162 @@ def build_mcp_server(
         либо относительное значение вида '-1h'/'-1d'."""
         return await _git_host_call(host, lambda p: p.list_commits(owner, repo, since=since, until=until, branch=branch, limit=limit))
 
-    @mcp.tool(title="Получение списка pull request'ов")
+    @tool("Получение списка pull request'ов", GROUP_GIT_API)
     async def git_host_list_pull_requests(
         host: str, owner: str, repo: str, state: str = "all", since: Optional[str] = None, limit: int = 50,
     ) -> GitHostResult:
         """`state` — 'open' | 'closed' | 'all'."""
         return await _git_host_call(host, lambda p: p.list_pull_requests(owner, repo, state=state, since=since, limit=limit))
 
-    @mcp.tool(title="Получение списка issues")
+    @tool("Получение списка issues", GROUP_GIT_API)
     async def git_host_list_issues(
         host: str, owner: str, repo: str, state: str = "all", since: Optional[str] = None, limit: int = 50,
     ) -> GitHostResult:
         """`state` — 'open' | 'closed' | 'all'."""
         return await _git_host_call(host, lambda p: p.list_issues(owner, repo, state=state, since=since, limit=limit))
 
-    @mcp.tool(title="Получение списка релизов")
+    @tool("Получение списка релизов", GROUP_GIT_API)
     async def git_host_list_releases(host: str, owner: str, repo: str, limit: int = 20) -> GitHostResult:
         return await _git_host_call(host, lambda p: p.list_releases(owner, repo, limit=limit))
 
-    @mcp.tool(title="Получение информации о репозитории")
+    @tool("Получение информации о репозитории", GROUP_GIT_API)
     async def git_host_get_repo(host: str, owner: str, repo: str) -> GitHostResult:
         return await _git_host_call(host, lambda p: p.get_repo(owner, repo))
 
-    @mcp.tool(title="Получение файла из репозитория")
+    @tool("Получение файла из репозитория", GROUP_GIT_API)
     async def git_host_get_file(host: str, owner: str, repo: str, path: str, ref: Optional[str] = None) -> GitHostResult:
         return await _git_host_call(host, lambda p: p.get_file(owner, repo, path, ref=ref))
+
+    async def _call(coro) -> Dict[str, Any]:
+        try:
+            return await coro
+        except _EXPECTED_ERRORS as exc:
+            return {"error": str(exc)}
+
+    if features.web_search:
+
+        @tool("Поиск в DuckDuckGo", GROUP_WEB_SEARCH)
+        async def duckduckgo_search(
+            query: str, max_results: int = 10, timelimit: Optional[str] = None, region: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """Поиск в интернете через DuckDuckGo. Возвращает только список найденных страниц
+            (title, url, snippet — короткий фрагмент), сами страницы НЕ читает: чтобы узнать
+            содержимое (новости, статью, факты), открой нужную ссылку инструментом read_web_page.
+            Если пользователь назвал конкретный сайт (например, rbc.ru), его можно открыть сразу
+            через read_web_page, без поиска. `timelimit`: 'd' | 'w' | 'm' | 'y' — за день/неделю/
+            месяц/год. `region` — например 'ru-ru', 'us-en'. `result_id` выдачи можно передать
+            следующему шагу (summarize, save_to_text_file)."""
+            return await _call(pipeline_tools.duckduckgo_search(query, max_results, timelimit, region))
+
+        @tool("Чтение страницы", GROUP_WEB_SEARCH)
+        async def read_web_page(url: str, max_chars: int = 8000, include_links: bool = True) -> Dict[str, Any]:
+            """Открывает веб-страницу и возвращает её читаемый текст (без скриптов и меню) и
+            ссылки со страницы (links: text, url). Адрес можно без https:// — например 'rbc.ru'.
+            Главная страница новостного сайта даёт список заголовков со ссылками: чтобы
+            пересказать новость подробно, открой ссылку на статью ещё одним вызовом.
+            `max_chars` — сколько текста вернуть (до 20000; полный текст сохраняется, его
+            `result_id` можно передать в summarize или save_to_text_file). Не открывает
+            внутренние адреса; страницы, которые показывают содержимое только через
+            JavaScript, могут вернуться почти пустыми."""
+            return await _call(pipeline_tools.read_web_page(url, max_chars, include_links))
+
+    if features.llm:
+
+        @tool("Суммарный ответ", GROUP_LLM)
+        async def summarize(
+            result_id: Optional[str] = None, text: Optional[str] = None, question: Optional[str] = None,
+            depth: str = "snippets", max_pages: int = 3, length: str = "medium",
+        ) -> Dict[str, Any]:
+            """Суммарный ответ (Markdown), составленный моделью. Материал — `result_id`
+            предыдущего шага (например, duckduckgo_search) ИЛИ произвольный `text`.
+            Для результатов поиска ответ ссылается на источники [n] и заканчивается
+            списком источников. `question` — на что ответить (по умолчанию — поисковый
+            запрос). `depth`: 'snippets' — по фрагментам выдачи, 'pages' — загрузить и
+            прочитать `max_pages` первых страниц (до 5). `length`: 'short' | 'medium' | 'long'.
+            Возвращает `result_id` ответа и сам текст `markdown`."""
+            return await _call(pipeline_tools.summarize(result_id, text, question, depth, max_pages, length))
+
+    if features.files:
+
+        @tool("Сохранить в текстовый файл", GROUP_FILES)
+        async def save_to_text_file(
+            filename: str, result_id: Optional[str] = None, content: Optional[str] = None, overwrite: bool = False,
+        ) -> Dict[str, Any]:
+            """Сохраняет в текстовый файл (.md, .txt, .csv, .json, .log; без расширения —
+            .md) результат предыдущего шага (`result_id`) ИЛИ текст `content`. `filename` —
+            относительный путь в каталоге файлов сервера, можно с подстановками {date},
+            {time}, {datetime}: 'reports/{date}-mcp.md'. Существующий файл перезаписывается
+            только при `overwrite=true`. Возвращает путь, размер и sha256."""
+            return await _call(pipeline_tools.save_to_text_file(filename, result_id, content, overwrite))
+
+    if features.files and pipeline_tools.files is not None:
+        snapshots = SnapshotStore(str(pipeline_tools.files.root))
+
+        @tool("Сохранять ответ инструмента", GROUP_FILES)
+        async def save_tool_result(
+            tool: str, args: Optional[Dict[str, Any]] = None, reset: bool = False, max_items: int = 100,
+            ctx: Optional[Context] = None,
+        ) -> Dict[str, Any]:
+            """Отслеживание изменений: вызывает инструмент-источник `tool` с аргументами `args`
+            (git_host_list_commits, git_host_list_pull_requests, git_host_list_issues,
+            git_host_list_releases, duckduckgo_search), сохраняет его ответ в JSON для ЭТОГО чата
+            и сравнивает с прошлым сохранённым ответом. Первый вызов (first_run=true) возвращает
+            все элементы — по ним делается полный отчёт. Следующие вызовы с теми же параметрами
+            возвращают только изменения с прошлого раза: new_items (новые коммиты, PR, issues)
+            и changed_items (изменившиеся, например закрытый PR); has_changes=false — ничего
+            нового. Используй ВМЕСТО прямого вызова инструмента-источника, когда просят следить
+            за обновлениями или сообщать только о новом. Пример: tool="git_host_list_commits",
+            args={"host": "github", "owner": "octocat", "repo": "hello-world"}. `reset=true` —
+            начать заново (забыть сохранённое). `max_items` — сколько элементов вернуть."""
+            if not _is_trackable(tool) or tool not in registry:
+                available = sorted(n for n in registry if _is_trackable(n))
+                return {"error": f"инструмент {tool!r} нельзя отслеживать; доступны: {available}"}
+            source = registry[tool]
+            call_args = dict(args or {})
+            try:
+                output = await source(**call_args)
+            except TypeError as exc:
+                return {"error": f"неверные аргументы для {tool}: {exc}"}
+            try:
+                items = extract_items(output)
+            except SnapshotError as exc:
+                return {"error": f"{tool}: {exc}"}
+            params = inspect.signature(source).parameters
+            limit_arg = next((a for a in ("limit", "max_results") if a in params), None)
+            requested_limit = None
+            if limit_arg:
+                requested_limit = call_args.get(limit_arg, params[limit_arg].default)
+            chat_id = caller_chat_id(ctx)
+            result = await asyncio.to_thread(
+                snapshots.compare_and_save, chat_id or "shared", tool, call_args, items, reset,
+                requested_limit if isinstance(requested_limit, int) else None,
+            )
+            limit = max(1, min(int(max_items or 100), 500))
+            if len(result["new_items"]) > limit:
+                result["new_items_omitted"] = len(result["new_items"]) - limit
+                result["new_items"] = result["new_items"][:limit]
+            result["chat_scoped"] = chat_id is not None
+            result["summary"] = (
+                f"Первый вызов: сохранено {result['new_count']} элементов — это полный список."
+                if result["first_run"] else
+                f"С прошлого вызова ({result['previous_run_at']}): новых {result['new_count']}, "
+                f"изменившихся {result['changed_count']}."
+                + (" Возможно, новых больше, чем поместилось в ответ, — увеличьте limit."
+                   if result["possibly_incomplete"] else "")
+            )
+            return result
+
+    chain_tools = dict(registry)
+
+    @tool("Цепочка инструментов", GROUP_PIPELINES)
+    async def run_pipeline(steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Выполняет инструменты этого сервера по очереди за один вызов. Шаг —
+        {"tool": "<имя>", "args": {...}}. В аргументах "$prev" — result_id предыдущего
+        шага, "$prev.<поле>" — его поле, "$2" / "$2.<поле>" — шага 2. Останавливается на
+        первой ошибке. Возвращает трассу шагов и проверки передачи данных между ними.
+        Пример: [{"tool": "duckduckgo_search", "args": {"query": "..."}},
+        {"tool": "summarize", "args": {"result_id": "$prev"}},
+        {"tool": "save_to_text_file", "args": {"result_id": "$prev", "filename": "reports/{date}.md"}}]"""
+        return await _call(run_pipeline_impl(steps, chain_tools))
 
     return mcp

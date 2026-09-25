@@ -3,12 +3,13 @@ mcp_server.config
 ===================
 
 Настройки уровня сервиса (аналог `agents_core.config.AgentConfig`, тот же
-стиль): адрес/порт HTTP-сервера, путь к собственной SQLite, токены
+стиль): адрес/порт HTTP-сервера, включаемые группы инструментов, токены
 Git-хостингов. Всё считывается один раз из переменных окружения либо файла
 `.env` рядом с местом запуска процесса.
 
 MCP-сервер — САМОДОСТАТОЧНЫЙ отдельный сервис: не импортирует ничего из
-`agents_core`, разворачивается отдельным процессом со своей БД.
+`agents_core`, разворачивается отдельным процессом. Своей базы нет: периодические задачи
+живут в отдельном сервисе планировщика (scheduler_service).
 """
 
 from __future__ import annotations
@@ -18,13 +19,19 @@ from pathlib import Path
 from typing import Optional
 
 
+#: Откуда загружен `.env` (None — файл не найден); печатается при старте.
+DOTENV_PATH: Optional[Path] = None
+
+
 def _load_dotenv(path: str = ".env") -> None:
     """Минимальный загрузчик `.env` — тот же формат, что и в
     `agents_core.config._load_dotenv`: строки вида KEY=VALUE, комментарии
     через '#', уже существующие переменные окружения имеют приоритет."""
+    global DOTENV_PATH
     file = Path(path)
     if not file.exists():
         return
+    DOTENV_PATH = file.resolve()
     for raw_line in file.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -52,11 +59,37 @@ class MCPConfig:
     # Не заданы -> выключены: инструменты группы не попадают в список
     # доступных ни AgentsCore (MCP tools/list), ни AgentsApp (/api/tools).
     LOCAL_GIT_ENABLED: bool = _bool_env("MCP_LOCAL_GIT_ENABLED")
-    SCHEDULER_ENABLED: bool = _bool_env("MCP_SCHEDULER_ENABLED")
+    HTTP_FETCH_ENABLED: bool = _bool_env("MCP_HTTP_FETCH_ENABLED")
+    # Интернет поиск (DuckDuckGo через ddgs + чтение страниц), суммарный
+    # ответ LLM, сохранение в текстовые файлы — общие инструменты пайплайнов
+    # (см. features.py).
+    WEB_SEARCH_ENABLED: bool = _bool_env("MCP_WEB_SEARCH_ENABLED")
+    LLM_ENABLED: bool = _bool_env("MCP_LLM_ENABLED")
+    FILES_ENABLED: bool = _bool_env("MCP_FILES_ENABLED")
+
+    # --- Интернет поиск: DuckDuckGo -----------------------------------------
+    # Поисковик(и) внутри ddgs: "duckduckgo" — только DuckDuckGo; можно
+    # перечислить через запятую ("duckduckgo,brave") или "auto".
+    DDGS_BACKEND: str = os.environ.get("MCP_DDGS_BACKEND", "duckduckgo").strip() or "duckduckgo"
+    DDGS_REGION: str = os.environ.get("MCP_DDGS_REGION", "ru-ru").strip() or "ru-ru"
+    DDGS_TIMEOUT: float = float(os.environ.get("MCP_DDGS_TIMEOUT", "15") or "15")
+
+    # --- LLM для «Суммарного ответа» (OpenAI-совместимый API) ---------------
+    LLM_BASE_URL: str = os.environ.get("MCP_LLM_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
+    LLM_API_KEY: str = os.environ.get("MCP_LLM_API_KEY", "").strip()
+    LLM_MODEL: str = os.environ.get("MCP_LLM_MODEL", "deepseek-v4-flash").strip()
+    LLM_TIMEOUT: float = float(os.environ.get("MCP_LLM_TIMEOUT", "120") or "120")
+    LLM_MAX_TOKENS: int = int(os.environ.get("MCP_LLM_MAX_TOKENS", "2000") or "2000")
+
+    # --- Файлы и промежуточные результаты -----------------------------------
+    # Каталог, куда пишет save_to_text_file (за его пределы запись невозможна).
+    FILES_DIR: str = os.environ.get("MCP_FILES_DIR", "mcp_files").strip() or "mcp_files"
+    # Промежуточные результаты шагов (result_id) и сколько их хранить.
+    DATA_DIR: str = os.environ.get("MCP_DATA_DIR", "mcp_data").strip() or "mcp_data"
+    RESULT_TTL_HOURS: float = float(os.environ.get("MCP_RESULT_TTL_HOURS", "24") or "24")
 
     HOST: str = os.environ.get("MCP_HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("MCP_PORT", "8001"))
-    DB_PATH: str = os.environ.get("AGENT_MCP_DB_PATH", "mcp_server.db")
 
     # Заготовка под будущую аутентификацию между сервисами (AgentsCore/
     # AgentsApp -> этот сервис) — пока не используется НИГДЕ в коде (см. ТЗ:

@@ -1,16 +1,20 @@
 # MCP-сервер
 
-Третий, полностью самостоятельный компонент (наравне с AgentsCore и
-AgentsApp): отдельный процесс, отдельная SQLite-база, отдельный деплой.
-Предоставляет:
+Самостоятельный компонент (наравне с AgentsCore, AgentsApp и планировщиком):
+отдельный процесс без своей базы данных. Предоставляет:
 
-1. **MCP-протокол** (Streamable HTTP, спецификация 2026-07-28, stateless) под
-   `/mcp` — им пользуется **AgentsCore** как MCP-клиент (`list_tools`/`call_tool`).
-2. **Обычный REST API** под `/api` — им пользуется **AgentsApp** напрямую, в
-   обход AgentsCore (статус, список инструментов, регистрация периодических
-   задач, история запусков, статус Git-хостингов).
-3. **Один экземпляр APScheduler** внутри этого же процесса, исполняющий
-   зарегистрированные периодические задачи (`scheduled_tools`).
+1. **MCP-протокол** (Streamable HTTP, stateless) под `/mcp` — им пользуются
+   **AgentsCore** (инструменты для агентов) и **планировщик**
+   (`scheduler_service`, задачи «Инструмент MCP» по расписанию).
+2. **REST API** под `/api` — им пользуется **AgentsApp** напрямую: состояние
+   сервера, список инструментов, статус Git-хостингов.
+
+Периодических задач здесь больше нет: они перенесены в отдельный сервис
+планировщика (`scheduler_service`), который вызывает инструменты этого сервера
+по протоколу MCP. Сервер можно запускать в нескольких экземплярах, но тогда
+каталоги `MCP_DATA_DIR` (промежуточные результаты цепочек) и `MCP_FILES_DIR`
+(сохранённые файлы) должны быть общими: шаги одной цепочки из чата могут
+попасть на разные экземпляры.
 
 ## Запуск
 
@@ -25,25 +29,14 @@ python -m mcp_server
 `mcp` 2.x `FastMCP` переименован в `MCPServer` и переехал в
 `mcp.server.mcpserver` — если увидите при запуске
 `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`, значит в
-окружении уже стоит 2.x (например, было установлено раньше для другого
-проекта) — переустановите зависимость: `pip install "mcp[cli]<2"`.
+окружении уже стоит 2.x — переустановите зависимость: `pip install "mcp[cli]<2"`.
 
-По умолчанию слушает `0.0.0.0:8001`. AgentsCore должен указывать на
-`http://<host>:8001/mcp` (конфиг `MCP_SERVER_URL`), AgentsApp — на
-`http://<host>:8001/api/...`.
+При старте сервер печатает, какой `.env` прочитал, какие группы инструментов
+включены (для LLM — модель или отсутствие ключа, для файлов — полный путь к
+каталогу) и полный список зарегистрированных инструментов.
 
-## Однократный экземпляр — обязательно
-
-**Не запускайте больше одной реплики этого процесса одновременно.**
-Планировщик (`APScheduler`) живёт внутри процесса и не координируется между
-репликами — при двух и более запущенных процессах каждая периодическая
-задача будет выполняться параллельно в каждой реплике, что для `git_pull`
-безобидно, но для `http_fetch`/`git_host_poll` с одинаковыми параметрами
-означает дублирование внешних запросов и, потенциально, дублирование
-побочных эффектов на удалённой стороне (если резолвер `action` в будущем
-станет вызывать что-то с эффектами, скажем — вебхук). Если нужна
-отказоустойчивость — используйте supervisor/systemd с перезапуском
-единственного процесса, а не горизонтальное масштабирование.
+По умолчанию слушает `0.0.0.0:8001`. AgentsCore и планировщик указывают на
+`http://<host>:8001/mcp`, AgentsApp — на `http://<host>:8001/`.
 
 ## Конфигурация
 
@@ -52,101 +45,186 @@ python -m mcp_server
 | Переменная | Назначение |
 |---|---|
 | `MCP_HOST`, `MCP_PORT` | адрес/порт HTTP-сервера |
-| `AGENT_MCP_DB_PATH` | путь к собственной SQLite-базе |
 | `MCP_API_KEY` | заготовка под будущую аутентификацию (пока не используется) |
 | `GITHUB_TOKEN`/`GITLAB_TOKEN`/`GITEA_TOKEN` + `*_API_URL` | доступ к Git-хостингам; без токена — анонимный режим для публичных репозиториев |
 | `MCP_HTTP_TIMEOUT` | таймаут HTTP-запросов (сек) |
-| `MCP_LOCAL_GIT_ENABLED` | работа с локальными рабочими копиями git (`execute_git_command`, задачи `git_pull`); по умолчанию **выключено** |
-| `MCP_SCHEDULER_ENABLED` | периодические задачи и планировщик; по умолчанию **выключено** |
+| `MCP_LOCAL_GIT_ENABLED` | локальный Git (`execute_git_command`, `git_pull`); по умолчанию **выключено** |
+| `MCP_HTTP_FETCH_ENABLED` | произвольный HTTP-запрос с сервера (`http_fetch`); по умолчанию **выключено** |
+| `MCP_WEB_SEARCH_ENABLED` | «Интернет поиск»: `duckduckgo_search`, `read_web_page`; по умолчанию **выключено** |
+| `MCP_DDGS_BACKEND`, `MCP_DDGS_REGION`, `MCP_DDGS_TIMEOUT` | поисковик внутри `ddgs` (`duckduckgo`, список через запятую или `auto`), регион (`ru-ru`), таймаут |
+| `MCP_LLM_ENABLED` + `MCP_LLM_API_KEY` | «Обработка LLM»: `summarize`; без ключа группа не включается |
+| `MCP_LLM_BASE_URL`, `MCP_LLM_MODEL`, `MCP_LLM_TIMEOUT`, `MCP_LLM_MAX_TOKENS` | OpenAI-совместимый API модели (по умолчанию DeepSeek, `deepseek-v4-flash`) |
+| `MCP_FILES_ENABLED`, `MCP_FILES_DIR` | «Работа с файлами»: `save_to_text_file` и каталог файлов (`mcp_files`) |
+| `MCP_DATA_DIR`, `MCP_RESULT_TTL_HOURS` | промежуточные результаты шагов (`result_id`) и срок их хранения (24 ч) |
 
 ### Включаемые возможности
 
-Пока настройка не задана (или `false`), инструменты группы **не попадают в
-список доступных** — ни агенту (AgentsCore получает их через MCP
-`tools/list`), ни приложению (`GET /api/tools`):
+Пока настройка не задана (или `false`), инструменты группы **не
+регистрируются** — их нет ни у агента (MCP `tools/list`), ни в приложении
+(`GET /api/tools`), ни в форме задачи планировщика. Инструменты
+Git-хостингов (`git_host_*`) и цепочка `run_pipeline` доступны всегда.
+Состояние настроек отдаётся в `GET /api/status`.
 
-| Настройка | Что включает |
-|---|---|
-| `MCP_LOCAL_GIT_ENABLED=true` | `execute_git_command`; вид задачи `git_pull` (если включены и периодические задачи) |
-| `MCP_SCHEDULER_ENABLED=true` | `register_scheduled_tool`, `list_scheduled_tools`, `cancel_scheduled_tool`, `save_result`; REST `/api/scheduled-tools*` (без настройки — `409 {"error": ...}`); виды задач в `/api/tools`; сам планировщик |
+## MCP-инструменты (`/mcp`)
 
-Инструменты Git-хостингов (`git_host_*`) доступны всегда. Текущее состояние
-обеих настроек печатается при старте и отдаётся в `GET /api/status`
-(`scheduling_enabled`, `local_git_enabled`) — AgentsApp по ним прячет раздел
-периодических задач. Если выключить настройку, уже заведённые задачи
-остаются в базе: без `MCP_SCHEDULER_ENABLED` они не срабатывают вовсе, а
-задачи `git_pull` без `MCP_LOCAL_GIT_ENABLED` при срабатывании записывают в
-историю ошибку «действие выключено», не выполняясь.
-
-## MCP-инструменты (`/mcp`, для AgentsCore)
-
-Инструменты периодических задач и `execute_git_command` регистрируются,
-только если включены соответствующей настройкой (см. «Включаемые
-возможности» выше).
-
-- `register_scheduled_tool(name, schedule, action, params, description=None, input_schema=None)` —
-  завести периодическую задачу. `schedule`: `"every:<N><s|m|h>"` (например
-  `"every:30m"`), `"daily:HH:MM"`, либо обычный 5-полевой cron
-  (`"0 */2 * * *"`). `action` — одно из `git_pull`/`http_fetch`/`git_host_poll`.
-- `list_scheduled_tools(status=None)` — `status`: `"enabled"`/`"disabled"`/`None` (все).
-- `cancel_scheduled_tool(task_id)` — удаляет задачу и её задание в планировщике.
-- `execute_git_command(repo_path, command, args=None)` — разовый вызов
-  произвольной git-подкоманды над локальной рабочей копией (не только pull).
-- `save_result(task_id, data)` — сохранить результат вручную в историю запусков задачи.
 - `git_host_list_commits(host, owner, repo, since=None, until=None, branch=None, limit=50)`
 - `git_host_list_pull_requests(host, owner, repo, state="all", since=None, limit=50)`
 - `git_host_list_issues(host, owner, repo, state="all", since=None, limit=50)`
 - `git_host_list_releases(host, owner, repo, limit=20)`
 - `git_host_get_repo(host, owner, repo)`
 - `git_host_get_file(host, owner, repo, path, ref=None)`
+- `execute_git_command(repo_path, command, args=None)` — git-команда над
+  локальной рабочей копией (при `MCP_LOCAL_GIT_ENABLED`).
+- `git_pull(repo_path, remote="origin", branch=None)` — обновить локальную
+  рабочую копию (при `MCP_LOCAL_GIT_ENABLED`).
+- `http_fetch(url, method="GET", headers=None, body=None, timeout=30)` — HTTP-запрос
+  с сервера, тело ответа обрезается до 5000 символов (при `MCP_HTTP_FETCH_ENABLED`).
+- `duckduckgo_search(query, max_results=10, timelimit=None, region=None)` — «Поиск в
+  DuckDuckGo» (группа «Интернет поиск»).
+- `read_web_page(url, max_chars=8000, include_links=True)` — «Чтение страницы»
+  (группа «Интернет поиск»).
+- `summarize(result_id=None, text=None, question=None, depth="snippets", max_pages=3, length="medium")` —
+  «Суммарный ответ» (группа «Обработка LLM»).
+- `save_to_text_file(filename, result_id=None, content=None, overwrite=False)` —
+  «Сохранить в текстовый файл» (группа «Работа с файлами»).
+- `save_tool_result(tool, args=None, reset=False, max_items=100)` — «Сохранять ответ
+  инструмента» (группа «Работа с файлами»), см. ниже.
+- `run_pipeline(steps)` — «Цепочка инструментов» (группа «Пайплайны»).
 
+У каждого инструмента есть `title` — краткое русское описание для интерфейса.
+Группа инструмента передаётся в `_meta["agentscore/group"]`: «GIT API»
+(`git_host_*`), «Локальный GIT» (`execute_git_command`, `git_pull`),
+«HTTP-запросы» (`http_fetch`), «Интернет поиск», «Обработка LLM», «Работа с
+файлами», «Пайплайны». AgentsCore и приложение показывают её в списке
+инструментов и в строке «Использую инструмент …» в чате.
 `host` — один из `"github"`/`"gitlab"`/`"gitea"`. `since`/`until` принимают
 ISO8601 (`"2026-09-01T00:00:00Z"`) либо относительный формат (`"-1h"`, `"-1d"`).
 Ответы `git_host_*` включают `rate_limit_remaining`, когда хостинг его сообщает.
 
 Все инструменты возвращают `{"error": "..."}` при ожидаемых сбоях (неверные
-параметры, задача не найдена, 401/403/404/429, сетевая ошибка) — вместо
-исключения, чтобы модель на стороне AgentsCore могла среагировать на текст
-ошибки, а не получить оборванный вызов.
+параметры, 401/403/404/429, сетевая ошибка) — вместо исключения, чтобы модель
+могла среагировать на текст ошибки, а не получить оборванный вызов.
 
-### Пример: периодический опрос GitHub
+Поставить любой из этих инструментов на расписание — в планировщике
+(`scheduler_service`, задача «Инструмент MCP»), например «раз в час
+`git_host_list_releases` и передать результат агенту».
 
-```python
-register_scheduled_tool(
-    name="poll-acme-widgets",
-    action="git_host_poll",
-    schedule="every:1h",
-    params={"host": "github", "owner": "acme", "repo": "widgets", "resource": "commits", "since": "-1d"},
-)
+## Композиция инструментов: поиск → суммарный ответ → файл
+
+Общие инструменты можно вызывать по одному (из чата, по расписанию) или
+цепочкой. **Данные между шагами передаются по ссылке — `result_id`**, а не
+через контекст модели: шаг сохраняет результат в `MCP_DATA_DIR` и возвращает
+короткую справку, следующий шаг получает `result_id`. У каждого результата
+есть `sha256` содержимого и `source_result_id` — из чего он сделан. Так
+большие данные (страницы, выдача) не расходуют токены модели, а передачу
+между шагами можно проверить.
+
+**Интернет поиск.**
+- `duckduckgo_search` ищет через библиотеку [`ddgs`](https://pypi.org/project/ddgs/)
+  (официального API поиска у DuckDuckGo нет; библиотека неофициальная и при
+  частых запросах упирается в ограничение по частоте — тогда возвращается
+  понятная ошибка). Возвращает `result_id`, `count` и результаты `{n, title, url,
+  snippet}`. **Страниц не читает** — только список.
+- `read_web_page` открывает страницу (адрес можно без `https://`: `rbc.ru`) и
+  возвращает читаемый текст без скриптов и меню, заголовок, итоговый адрес
+  после редиректов и ссылки со страницы (`links: [{text, url}]` — заголовки
+  статей на главной новостного сайта). Полный текст (до 50 000 символов)
+  сохраняется под `result_id`, модели отдаётся `max_chars` (до 20 000).
+  Во внутреннюю сеть не ходит: адрес должен разрешаться в публичный IP, в том
+  числе после каждого редиректа. Страницы, которые рисуют содержимое только
+  JavaScript'ом, вернутся почти пустыми — тогда инструмент возвращает ошибку.
+
+Типичный разговор: «Расскажи последние новости РБК» → модель вызывает
+`duckduckgo_search`, затем `read_web_page` по первой ссылке (главная rbc.ru —
+список заголовков со ссылками), при необходимости открывает 1–2 статьи и
+пересказывает. «Расскажи последние новости rbc.ru» — сайт назван, модель может
+сразу открыть его через `read_web_page`. Описания инструментов подсказывают
+модели именно такой порядок; окончательное решение за ней.
+
+**Обработка LLM — `summarize`.** Суммарный ответ в Markdown моделью по
+OpenAI-совместимому API (`MCP_LLM_*`, по умолчанию DeepSeek). Материал —
+`result_id` (выдача поиска, страница, другой ответ) или `text`. Для выдачи
+поиска ответ ссылается на источники `[n]`, а раздел «Источники» в конце
+формирует код — он точно совпадает с найденным; ссылки на несуществующие
+номера удаляются (`invalid_citations`). `depth="pages"` — сервер сам загружает
+до `max_pages` (≤ 5) первых страниц выдачи и передаёт их текст модели.
+Материалы — чужие данные: системный промпт требует не выполнять
+встречающихся в них указаний, инструментов у модели здесь нет.
+
+**Работа с файлами — `save_to_text_file`.** Пишет `result_id` или `content` в
+`.md/.txt/.csv/.json/.log` внутри `MCP_FILES_DIR` (без расширения — `.md`),
+подстановки `{date}`, `{time}`, `{datetime}` в имени, без `overwrite=true`
+существующий файл не перезаписывается. Абсолютные пути, `..`, скрытые файлы
+отклоняются. Возвращает `path`, `bytes`, `sha256` и `content_matches_source` —
+совпадает ли файл байт в байт с сохранённым результатом.
+
+**Пайплайны — `run_pipeline(steps)`.** Цепочка на сервере за один вызов,
+без модели между шагами:
+
+```json
+{"steps": [
+  {"tool": "duckduckgo_search", "args": {"query": "новости MCP", "timelimit": "w"}},
+  {"tool": "summarize", "args": {"result_id": "$prev", "depth": "pages", "max_pages": 3}},
+  {"tool": "save_to_text_file", "args": {"result_id": "$prev", "filename": "reports/{date}-mcp.md"}}
+]}
 ```
 
-Каждый час выполнится `git_host_list_commits(owner="acme", repo="widgets", since="-1d", ...)`
-и результат сохранится в `scheduled_tool_runs` (виден через
-`GET /api/scheduled-tools/{id}/runs`).
+`"$prev"` — `result_id` предыдущего шага, `"$prev.<поле>"` — его поле, `"$2"`,
+`"$2.<поле>"` — шага 2. Цепочка останавливается на первой ошибке (файл тогда
+не создаётся). Ответ — трасса шагов (`result_id`, `source_result_id`,
+`sha256`, время) и `checks`: каждый шаг получил результат предыдущего, файл
+совпадает с суммарным ответом. `run_pipeline` можно поставить на расписание в
+планировщике (задача «Инструмент MCP», `steps` — JSON).
 
-`resource` для `git_host_poll` — один из `commits`/`pull_requests`/`issues`/
-`releases`/`repo`/`file` (для `file` также обязателен `path`, опционально `ref`).
+## Отслеживание изменений: «Сохранять ответ инструмента»
+
+`save_tool_result(tool, args, reset=False, max_items=100)` вызывает
+инструмент-источник — `git_host_list_commits`, `git_host_list_pull_requests`,
+`git_host_list_issues`, `git_host_list_releases` или `duckduckgo_search` — с
+аргументами `args`, сохраняет ответ в JSON и сравнивает с прошлым сохранённым:
+
+- **первый вызов** (`first_run: true`) — сохраняет и возвращает весь список
+  (`new_items` — все элементы): по нему модель делает полный отчёт;
+- **следующие вызовы** с теми же параметрами — только изменения с прошлого
+  раза: `new_items` (новые коммиты, PR, issues, релизы, результаты поиска) и
+  `changed_items` (тот же элемент, другое содержимое — например, PR закрыт;
+  с перечнем `changed_fields`); `has_changes: false` — ничего нового.
+
+Элемент узнаётся по `sha` / `number` / `tag` / `url` / `id`. Снимок хранит все
+когда-либо увиденные элементы (до 2000), а не только последний ответ, поэтому
+элементы, выпавшие из окна `limit`, не считаются удалёнными. Если все элементы
+ответа новые и их ровно `limit`, выставляется `possibly_incomplete` — за время
+между вызовами могло появиться больше, чем помещается в ответ.
+
+Снимки **свои у каждого чата**: AgentsCore передаёт `chat_id` в `_meta` вызова.
+Файл — `MCP_FILES_DIR/snapshots/<chat_id>/<инструмент>_<параметры>_<хеш>.json`
+(вызов без чата, например из планировщика напрямую, пишет в `snapshots/shared/`);
+его видно в приложении в разделе «Файлы». Что именно отслеживается —
+инструмент и аргументы без окна (`limit`, `since`, `until`, `max_results`,
+`timelimit`): смена `limit` не начинает отслеживание заново. `reset: true` —
+забыть сохранённое и начать с полного списка. Включается вместе с «Работой с
+файлами» (`MCP_FILES_ENABLED`).
+
+Сценарий: в чате выбраны «Сохранять ответ инструмента» и «Получение списка
+коммитов», просьба «Сформируй отчёт по коммитам в github.com/owner/repo,
+обновляй информацию при новых коммитах» → модель вызывает
+`save_tool_result(tool="git_host_list_commits", args={"host": "github",
+"owner": "owner", "repo": "repo", "limit": 100})` и делает отчёт по всем
+коммитам. Повторить по расписанию — задача планировщика «Запрос агенту» в этот
+же чат («Проверь новые коммиты в github.com/owner/repo и сообщи только о
+новых»): при каждом запуске модель вызывает тот же инструмент в этом чате и
+получает только новые коммиты. Первый полный отчёт ограничен одним запросом к
+хостингу — до 100 последних коммитов.
 
 ## REST API (`/api`, для AgentsApp)
 
 | Метод | Путь | Назначение |
 |---|---|---|
-| GET | `/api/status` | `{scheduler_running, tool_count, scheduled_count, scheduling_enabled, local_git_enabled}` |
-| GET | `/api/tools` | доступные инструменты `{name, title, description, parameters, schedulable}`; `title` — краткое русское описание для интерфейса |
-| GET | `/api/scheduled-tools` | список периодических задач |
-| POST | `/api/scheduled-tools` | создать задачу |
-| PATCH | `/api/scheduled-tools/{id}` | частично изменить (в т.ч. `enabled`) |
-| DELETE | `/api/scheduled-tools/{id}` | удалить |
-| GET | `/api/scheduled-tools/{id}/runs?limit=50` | история запусков |
+| GET | `/api/status` | `{tool_count, local_git_enabled, http_fetch_enabled, web_search_enabled, llm_enabled, llm_model, files_enabled}` |
+| GET | `/api/tools` | доступные инструменты `{name, title, description, parameters, group}` |
 | GET | `/api/git-hosts` | `[{host, configured, api_url, rate_limit_remaining, rate_limit_reset_at}]` |
-
-`schedulable=true` в `/api/tools` стоит только у трёх `action`
-(`git_pull`/`http_fetch`/`git_host_poll`) — это единственное, что можно
-поставить на расписание через `POST /api/scheduled-tools` (сама
-`register_scheduled_tool` принимает `action`-enum, а не произвольное имя
-MCP-инструмента). Остальные перечисленные инструменты (например
-`execute_git_command`, `git_host_get_file`) — разовые вызовы для модели,
-не для расписания.
+| GET | `/api/files` | файлы «Работы с файлами», новые сверху: `[{path, bytes, modified_at}]` (404, если группа выключена) |
+| GET | `/api/files/content?path=…` | содержимое файла: `{path, bytes, modified_at, sha256, content}` |
 
 ### Git-хостинги через API
 
@@ -172,45 +250,23 @@ MCP-инструмента). Остальные перечисленные ин�
   насколько вызов "безопасен" — это ответственность вызывающей стороны
   (модели через AgentsCore). Явно не рекомендуется открывать этот сервис
   без сетевой изоляции, пока не введена аутентификация.
+- `read_web_page` и `summarize(depth="pages")` загружают только публичные
+  адреса (проверка IP после каждого редиректа), не больше 2 МБ на страницу.
+  `http_fetch` такой проверки не делает — поэтому он выключен по умолчанию.
+- `save_to_text_file` пишет только внутри `MCP_FILES_DIR` и только текстовые
+  расширения; ключ модели (`MCP_LLM_API_KEY`) не логируется.
 - Токены Git-хостингов никогда не попадают в логи (проверено в
   `git_hosts/*`: логируются код ответа и хост, не тело запроса/заголовки).
 
 ## Ограничения окружения разработки
 
-Этот проект писался в песочнице, где недоступны для установки `fastapi`,
-`apscheduler`, `respx`, `croniter`, `pytest` (сеть к pip заблокирована для
-части пакетов). Из-за этого:
-
-- `mcp_server/cron.py` — собственная чистая реализация разбора расписаний
-  (`every:`/`daily:`/cron), а не обёртка над `croniter`. `scheduler.py`
-  использует `apscheduler`'ные `IntervalTrigger`/`CronTrigger` напрямую в
-  реальном деплое (там `croniter` не нужен — у apscheduler свой парсер);
-  `cron.py` используется независимо для `next_run_at` в REST-ответах и
-  валидации, тестируемых без установленного apscheduler.
-- `mcp_server/scheduler.py` импортирует `apscheduler.*` только внутри тел
-  функций — модуль импортируется даже без установленного пакета;
-  `tests/test_scheduler.py` помечен `@unittest.skipUnless(...)` и пропускается
-  в этом окружении (написан и готов выполняться при реальном деплое).
-- `tests/test_api.py` (FastAPI `TestClient`) аналогично помечен
-  `skipUnless` — сама бизнес-логика, которую вызывают REST-роуты
-  (`store.py`, `git_hosts/*`), протестирована отдельно и полно.
-- `tests/test_git_hosts.py`/`test_actions.py` используют `httpx.MockTransport`
-  вместо `respx` (тоже недоступен) — фейковый HTTP-транспорт того же уровня
-  детализации (проверка URL/заголовков/тела запроса, симуляция 401/403/404/429
-  и повторов с backoff).
-
-Перед деплоем: `pip install -r requirements.txt` в окружении с доступом к
-PyPI и `python -m unittest discover -s tests` — тогда пропущенные здесь
-тесты (`test_scheduler.py`, `test_api.py`) тоже выполнятся.
-
-**Урок на будущее (зафиксирован здесь намеренно):** именно из-за того, что
-`test_api.py` не выполнялся в песочнице, где писался этот код, два
-реальных бага в монтировании `/mcp` (см. «Устранение неполадок» ниже)
-обнаружились только при первом живом запуске у пользователя, а не тестами.
-`tests/test_api.py::McpEndpointTests` — тест именно на этот случай
-(реальный HTTP-запрос к `/mcp`, а не только к `/api/*`), добавлен когда
-баг уже был найден и исправлен; при доступном `fastapi` обязательно
-прогонять его вместе с остальными.
+Проект писался в песочнице, где `fastapi` недоступен для установки. Поэтому
+`tests/test_api.py` (FastAPI `TestClient`, в том числе реальный запрос к
+`/mcp`) там пропускается; остальное (инструменты, действия, Git-хостинги на
+`httpx.MockTransport`) проверено. Перед деплоем: `pip install -r requirements.txt`
+и `python -m unittest discover -s tests` — тогда выполнятся и пропущенные тесты.
+Именно из-за пропуска этих тестов два бага монтирования `/mcp` (см. ниже)
+в своё время нашлись только при живом запуске.
 
 ## Устранение неполадок
 
@@ -237,9 +293,9 @@ PyPI и `python -m unittest discover -s tests` — тогда пропущенн
 приложению верхнего уровня) — а `streamable_http_app()` требует, чтобы
 именно её lifespan (`session_manager.run()`) был запущен, иначе она не
 может обработать вообще ни одного запроса. Исправлено явным объединением
-lifespan'ов в `create_app_with_store` (`contextlib.AsyncExitStack`,
+lifespan'ов в `create_app` (`contextlib.AsyncExitStack`,
 `mcp.session_manager.run()`) — приём из докстринга самого
-`FastMCP.session_manager`, официально рассчитанного как раз на
+`FastMCP.session_manager`, рассчитанного как раз на
 монтирование FastMCP внутри стороннего ASGI-приложения.
 
 ## Структура
@@ -247,21 +303,26 @@ lifespan'ов в `create_app_with_store` (`contextlib.AsyncExitStack`,
 ```
 mcp_server/
   __main__.py       # точка входа: python -m mcp_server
-  app.py             # сборка FastAPI: монтирует /mcp и /api, lifespan (старт/стоп планировщика)
-  config.py          # MCPConfig — вся конфигурация из окружения/.env
-  server.py          # 11 MCP-инструментов (@mcp.tool())
-  api.py             # REST-роутер для AgentsApp
-  schemas.py         # Pydantic-схемы REST API
-  deps.py            # FastAPI Depends (store/scheduler/mcp)
-  db.py              # sqlite3: scheduled_tools, scheduled_tool_runs
-  store.py           # бизнес-логика над db.py (валидация, next_run_at, история)
-  scheduler.py        # обёртка над APScheduler (один инстанс на процесс)
-  actions.py          # исполнение action: git_pull/http_fetch/git_host_poll + execute_git_command
-  cron.py            # свой разбор расписаний (see "Ограничения окружения разработки")
-  models.py          # dataclasses ScheduledTool/ScheduledToolRun/GitHostStatus
+  app.py            # сборка FastAPI: /api и /mcp, lifespan MCP-приложения
+  config.py         # MCPConfig — конфигурация из окружения/.env
+  features.py       # включаемые группы инструментов
+  server.py         # регистрация MCP-инструментов с title и группой
+  actions.py        # git_pull, http_fetch, run_git_command
+  results.py        # хранилище промежуточных результатов (result_id, sha256)
+  web_search.py     # поиск через ddgs
+  web_pages.py      # загрузка страниц, HTML -> текст и ссылки, защита от внутренних адресов
+  llm.py            # клиент модели, промпты, проверка ссылок [n], Markdown
+  files.py          # безопасная запись/чтение файлов
+  pipeline_tools.py # duckduckgo_search, read_web_page, summarize, save_to_text_file
+  pipeline.py       # run_pipeline: ссылки $prev, трасса, проверки
+  snapshots.py      # save_tool_result: снимки ответов по чатам и дельта
+  api.py            # REST-роутер для AgentsApp
+  schemas.py        # Pydantic-схемы REST API
+  deps.py           # FastAPI Depends
+  models.py         # GitHostStatus
   git_hosts/
-    base.py          # общая retry/backoff/rate-limit логика, GitHostError
-    github.py, gitlab.py, gitea.py   # конкретные провайдеры
-    __init__.py       # get_provider(host), кэш httpx.AsyncClient, close_all_clients()
-tests/                # 110 тестов (14 пропущено в этом окружении, см. выше)
+    base.py         # общая retry/backoff/rate-limit логика, GitHostError
+    github.py, gitlab.py, gitea.py
+    __init__.py     # get_provider(host), кэш httpx.AsyncClient, close_all_clients()
+tests/
 ```

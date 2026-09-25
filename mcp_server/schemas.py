@@ -2,81 +2,46 @@
 mcp_server.schemas
 =====================
 
-Pydantic-схемы REST API для AgentsApp (стиль `agents_core.schemas`) — Часть
-2 ТЗ. Отдельно от MCP-инструментов (`server.py`), у которых свой формат
-(структурированный dict, а не response_model FastAPI)."""
+Pydantic-схемы REST API для AgentsApp (`/api`). У MCP-инструментов
+(`server.py`) свой формат — структурированный dict.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
-from .models import ACTION_KINDS
-
 
 class StatusOut(BaseModel):
-    scheduler_running: bool
     tool_count: int
-    scheduled_count: int = Field(..., description="Число ВКЛЮЧЁННЫХ периодических задач")
-    scheduling_enabled: bool = Field(True, description="Включены ли периодические задачи (MCP_SCHEDULER_ENABLED)")
-    local_git_enabled: bool = Field(True, description="Включена ли работа с локальным Git (MCP_LOCAL_GIT_ENABLED)")
+    local_git_enabled: bool = Field(..., description="Включена ли работа с локальным Git (MCP_LOCAL_GIT_ENABLED)")
+    http_fetch_enabled: bool = Field(..., description="Включён ли инструмент http_fetch (MCP_HTTP_FETCH_ENABLED)")
+    web_search_enabled: bool = Field(False, description="Интернет поиск: DuckDuckGo и чтение страниц (MCP_WEB_SEARCH_ENABLED)")
+    llm_enabled: bool = Field(False, description="Суммарный ответ LLM (MCP_LLM_ENABLED и MCP_LLM_API_KEY)")
+    llm_model: str = Field("", description="Модель суммарного ответа")
+    files_enabled: bool = Field(False, description="Сохранение в текстовые файлы (MCP_FILES_ENABLED)")
+
+
+class FileInfoOut(BaseModel):
+    path: str = Field(..., description="Путь относительно каталога файлов")
+    bytes: int
+    modified_at: int = Field(..., description="Время изменения, Unix-секунды")
+
+
+class FileContentOut(FileInfoOut):
+    sha256: str
+    content: str
 
 
 class ToolDescriptionOut(BaseModel):
-    """Один доступный MCP-инструмент — для экрана «MCP» (список
-    инструментов) и для формы «Добавить задачу» (какие из них
-    `schedulable`)."""
+    """Один доступный MCP-инструмент — для экрана «MCP-сервер»."""
 
     name: str
-    title: str = Field("", description="Краткое русское описание для интерфейса (например, «Получение информации о репозитории»)")
+    title: str = Field("", description="Краткое русское описание (например, «Получение информации о репозитории»)")
     description: str
     parameters: Dict[str, Any] = Field(default_factory=dict, description="JSON Schema параметров")
-    schedulable: bool = Field(..., description="Можно ли завести на него периодическую задачу (action)")
-
-
-class ScheduledToolOut(BaseModel):
-    id: str
-    name: str
-    description: str
-    action: str = Field(..., description=f"Одна из: {ACTION_KINDS}")
-    schedule: str = Field(..., description="'every:<N><s|m|h>' | 'daily:HH:MM' | 5-полевой cron")
-    params: Dict[str, Any] = Field(default_factory=dict)
-    input_schema: Optional[Dict[str, Any]] = None
-    enabled: bool
-    created_at: int
-    last_run_at: Optional[int] = None
-    next_run_at: Optional[int] = None
-
-
-class ScheduledToolCreate(BaseModel):
-    name: str = Field(..., min_length=1)
-    action: str = Field(..., description=f"Одна из: {ACTION_KINDS}")
-    schedule: str
-    description: str = ""
-    params: Dict[str, Any] = Field(default_factory=dict)
-    input_schema: Optional[Dict[str, Any]] = None
-    enabled: bool = True
-
-
-class ScheduledToolPatch(BaseModel):
-    name: Optional[str] = None
-    action: Optional[str] = None
-    schedule: Optional[str] = None
-    description: Optional[str] = None
-    params: Optional[Dict[str, Any]] = None
-    input_schema: Optional[Dict[str, Any]] = None
-    enabled: Optional[bool] = None
-
-
-class ScheduledToolRunOut(BaseModel):
-    id: str
-    tool_id: str
-    started_at: int
-    finished_at: Optional[int] = None
-    status: str = Field(..., description="'running' | 'success' | 'error'")
-    result: Optional[Any] = None
-    error: Optional[str] = None
+    group: str = Field("", description="Группа инструмента: «GIT API», «Локальный GIT», «HTTP-запросы»")
 
 
 class GitHostStatusOut(BaseModel):

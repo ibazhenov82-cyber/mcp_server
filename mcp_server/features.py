@@ -2,64 +2,44 @@
 mcp_server.features
 =====================
 
-Включаемые настройкой группы возможностей сервера (по замечанию
-пользователя): пока соответствующая настройка не задана, инструменты
-группы НЕ попадают в список доступных — ни в MCP-протокол (`tools/list`,
-им пользуется AgentsCore), ни в REST `GET /api/tools` (AgentsApp).
+Включаемые настройкой группы инструментов: пока настройка не задана,
+инструменты группы не попадают в список доступных — ни агенту (MCP
+`tools/list`), ни приложению (`GET /api/tools`).
 
-- `local_git` (`MCP_LOCAL_GIT_ENABLED`) — работа с ЛОКАЛЬНЫМИ рабочими
-  копиями git на машине MCP-сервера: инструмент `execute_git_command` и
-  вид периодической задачи `git_pull`.
-- `scheduling` (`MCP_SCHEDULER_ENABLED`) — периодические задачи:
-  инструменты `register_scheduled_tool`/`list_scheduled_tools`/
-  `cancel_scheduled_tool`/`save_result`, REST `/api/scheduled-tools*`,
-  виды задач (`action`) в `/api/tools` и сам планировщик (без этой
-  настройки он не запускается — уже заведённые задачи хранятся, но не
-  срабатывают).
+- `local_git` (`MCP_LOCAL_GIT_ENABLED`) — «Локальный GIT»: `execute_git_command`, `git_pull`.
+- `http_fetch` (`MCP_HTTP_FETCH_ENABLED`) — «HTTP-запросы»: `http_fetch`.
+- `web_search` (`MCP_WEB_SEARCH_ENABLED`) — «Интернет поиск»: `duckduckgo_search`, `read_web_page`.
+- `llm` (`MCP_LLM_ENABLED` и `MCP_LLM_API_KEY`) — «Обработка LLM»: `summarize`.
+- `files` (`MCP_FILES_ENABLED`) — «Работа с файлами»: `save_to_text_file`.
 
-Инструменты Git-хостингов (`git_host_*`) — публичные HTTP API
-GitHub/GitLab/Gitea — доступны всегда.
+Всегда доступны: Git-хостинги (`git_host_*`) и «Пайплайны» (`run_pipeline`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
 
 from .config import MCPConfig
-from .models import ACTION_KINDS
-
-#: Виды периодических задач, которым нужен локальный Git.
-LOCAL_GIT_ACTIONS = frozenset({"git_pull"})
-
-
-class FeatureDisabledError(RuntimeError):
-    """Обращение к выключенной настройкой возможности (REST отвечает 409)."""
 
 
 @dataclass(frozen=True)
 class Features:
     local_git: bool = False
-    scheduling: bool = False
+    http_fetch: bool = False
+    web_search: bool = False
+    llm: bool = False
+    files: bool = False
 
     @classmethod
     def from_config(cls) -> "Features":
-        return cls(local_git=MCPConfig.LOCAL_GIT_ENABLED, scheduling=MCPConfig.SCHEDULER_ENABLED)
+        return cls(
+            local_git=MCPConfig.LOCAL_GIT_ENABLED,
+            http_fetch=MCPConfig.HTTP_FETCH_ENABLED,
+            web_search=MCPConfig.WEB_SEARCH_ENABLED,
+            llm=MCPConfig.LLM_ENABLED and bool(MCPConfig.LLM_API_KEY),
+            files=MCPConfig.FILES_ENABLED,
+        )
 
     @classmethod
     def all_enabled(cls) -> "Features":
-        return cls(local_git=True, scheduling=True)
-
-    @property
-    def action_kinds(self) -> List[str]:
-        """Виды периодических задач, доступные на этом сервере: пусто без
-        `scheduling`; `git_pull` — только вместе с `local_git`."""
-        if not self.scheduling:
-            return []
-        return [a for a in ACTION_KINDS if self.local_git or a not in LOCAL_GIT_ACTIONS]
-
-    def require_scheduling(self) -> None:
-        if not self.scheduling:
-            raise FeatureDisabledError(
-                "Периодические задачи выключены на MCP-сервере (настройка MCP_SCHEDULER_ENABLED)"
-            )
+        return cls(local_git=True, http_fetch=True, web_search=True, llm=True, files=True)
