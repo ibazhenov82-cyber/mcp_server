@@ -133,6 +133,49 @@ class RemoteRepoTests(_RepoFixture):
         log = await self.manager.log(ref, limit=5)
         self.assertEqual(log["commits"][0]["subject"], "feature: v2")
 
+    async def test_pull_request_diff(self):
+        # PR #5 — ветка feature, опубликованная хостингом как refs/pull/5/head.
+        git("push", "origin", "feature:refs/pull/5/head", cwd=self.seed)
+        info = await self.manager.open("https://github.com/acme/widgets")
+        ref = self.manager.resolve(info["repo_id"])
+        diff = await self.manager.diff(ref, "pr:5")
+        self.assertEqual([f["path"] for f in diff["files"]], ["app.py"])
+        self.assertIn("PR #5", diff["title"])
+        self.assertIn("schedule v2", diff["patch"])
+        text = await self.manager.read_file(ref, "app.py", rev="pr:5")
+        self.assertIn("schedule v2", text["content"])
+        # PR обновился — повторный diff видит новый коммит.
+        git("checkout", "feature", cwd=self.seed)
+        (self.seed / "new.py").write_text("x = 1\n", encoding="utf-8")
+        git("add", ".", cwd=self.seed)
+        git("commit", "-m", "more", cwd=self.seed)
+        git("push", "origin", "feature:refs/pull/5/head", cwd=self.seed)
+        diff = await self.manager.diff(ref, "pr:5")
+        self.assertEqual(sorted(f["path"] for f in diff["files"]), ["app.py", "new.py"])
+        with self.assertRaises(RepoError):
+            await self.manager.diff(ref, "pr:99")
+
+    async def test_pull_request_diff_in_shallow_clone(self):
+        # Длинная история main: точка ответвления PR глубже, чем клон.
+        git("checkout", "main", cwd=self.seed)
+        git("checkout", "-b", "old-feature", cwd=self.seed)
+        (self.seed / "old.py").write_text("old\n", encoding="utf-8")
+        git("add", ".", cwd=self.seed)
+        git("commit", "-m", "old feature", cwd=self.seed)
+        git("push", "origin", "old-feature:refs/pull/7/head", cwd=self.seed)
+        git("checkout", "main", cwd=self.seed)
+        for i in range(5):
+            (self.seed / f"m{i}.txt").write_text(str(i), encoding="utf-8")
+            git("add", ".", cwd=self.seed)
+            git("commit", "-m", f"main {i}", cwd=self.seed)
+        git("push", "origin", "main", cwd=self.seed)
+        self.manager.clone_depth = 2
+        info = await self.manager.open("https://github.com/acme/widgets")
+        ref = self.manager.resolve(info["repo_id"])
+        diff = await self.manager.diff(ref, "pr:7")
+        self.assertEqual([f["path"] for f in diff["files"]], ["old.py"])
+        self.assertNotIn("общий предок не найден", diff["title"])
+
     async def test_reopen_fetches_new_commits(self):
         info = await self.manager.open("https://github.com/acme/widgets")
         git("checkout", "main", cwd=self.seed)

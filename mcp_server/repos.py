@@ -55,6 +55,8 @@ GIT_TIMEOUT = 60
 _SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/@{}~^+-]+$")
 _WIN_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _SCP_RE = re.compile(r"^[\w.-]+@([\w.-]+):(.+)$")
+#: Pull request / merge request: «pr:12», «pr/12», «mr:7», «#12».
+_PR_RE = re.compile(r"^(?:(?:pr|mr)[:/#]?|#)(\d+)$", re.I)
 
 
 @dataclass
@@ -239,6 +241,8 @@ class RepoManager:
         #: Адрес клона по хосту и owner/repo (тесты подменяют на локальные bare-репозитории).
         self.remote_url = remote_url or (lambda host, slug: f"https://{host}/{slug}.git")
         self.ledger = CommitLedger(os.path.join(data_dir, "repo_commits.json"))
+        #: Откуда догружена ветка PR ((путь копии, номер) → refspec хостинга).
+        self._pr_source: Dict[Tuple[str, int], str] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
@@ -476,9 +480,72 @@ class RepoManager:
         code, _, _ = await self._git(ref.path, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", check=False)
         return code == 0
 
+    @staticmethod
+    def _pr_sources(host: Optional[str], number: int) -> List[str]:
+        """Где хостинг хранит ветку PR: GitHub и Gitea — refs/pull/N/head,
+        GitLab — refs/merge-requests/N/head."""
+        github = f"refs/pull/{number}/head"
+        gitlab = f"refs/merge-requests/{number}/head"
+        return [gitlab, github] if host and "gitlab" in host else [github, gitlab]
+
+    async def _fetch_pr(self, ref: RepoRef, number: int) -> str:
+        """Догружает свежую ветку PR (в том числе из форка) в
+        refs/remotes/origin/pr/<N> — при каждом обращении, PR мог обновиться."""
+        target = f"refs/remotes/origin/pr/{number}"
+        for source in self._pr_sources(ref.host, number):
+            code, _, _ = await self._git(
+                ref.path, "fetch", *self._depth_args(), "origin", f"+{source}:{target}",
+                host=ref.host, timeout=self.clone_timeout, check=False,
+            )
+            if code == 0 and await self._verify(ref, f"origin/pr/{number}"):
+                self._pr_source[(ref.path, number)] = source
+                return f"origin/pr/{number}"
+        raise RepoError(f"pull request #{number} не найден в origin")
+
+    async def _default_base(self, ref: RepoRef) -> str:
+        """База для diff PR: ветка клона (проект открыт по ссылке на базовую
+        ветку) или ветка по умолчанию origin у локальной копии."""
+        if ref.kind == "remote" and ref.branch:
+            return ref.branch
+        code, out, _ = await self._git(ref.path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+        if code == 0 and out.strip():
+            return out.strip().split("/", 1)[-1]
+        return "HEAD"
+
+    async def _ensure_merge_base(self, ref: RepoRef, left: str, right: str) -> bool:
+        """«a...b» в неглубоком клоне: если общего предка не видно, история
+        догружается (сначала на 1000 коммитов, затем целиком)."""
+        async def has_base() -> bool:
+            code, _, _ = await self._git(ref.path, "merge-base", left, right, check=False)
+            return code == 0
+
+        if await has_base():
+            return True
+        if not os.path.exists(os.path.join(ref.path, ".git", "shallow")):
+            return False
+        refspecs = []
+        for name in (left, right):
+            m = re.match(r"^origin/pr/(\d+)$", name)
+            if m:
+                source = self._pr_source.get((ref.path, int(m.group(1))), f"refs/pull/{m.group(1)}/head")
+                refspecs.append(f"+{source}:refs/remotes/{name}")
+            elif name.startswith("origin/"):
+                branch = name[len("origin/"):]
+                refspecs.append(f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+        for depth_arg in ("--deepen=1000", "--unshallow"):
+            await self._git(ref.path, "fetch", depth_arg, "origin", *refspecs, host=ref.host,
+                            timeout=self.clone_timeout, check=False)
+            if await has_base():
+                return True
+        return False
+
     async def resolve_rev(self, ref: RepoRef, rev: str) -> str:
         """Ветка, тег или коммит → выражение, которое понимает git. В клоне по
-        URL отсутствующая ветка догружается (`git fetch origin <ветка>`)."""
+        URL отсутствующая ветка догружается (`git fetch origin <ветка>`).
+        «pr:12» — ветка pull request'а (merge request'а в GitLab)."""
+        pr = _PR_RE.match((rev or "").strip())
+        if pr:
+            return await self._fetch_pr(ref, int(pr.group(1)))
         rev = check_ref(rev, "ref")
         if await self._verify(ref, rev):
             return rev
@@ -627,13 +694,21 @@ class RepoManager:
             return ["HEAD"], "незакоммиченные изменения (рабочая копия и индекс против HEAD)"
         if spec in ("staged", "cached"):
             return ["--cached"], "подготовленные к коммиту изменения (индекс против HEAD)"
+        pr = _PR_RE.match(spec)
+        if pr:
+            # Diff PR — от точки ответвления от базовой ветки.
+            spec = f"{await self._default_base(ref)}...{spec}"
         for sep in ("...", ".."):
             if sep in spec:
                 a, _, b = spec.partition(sep)
                 left = await self.resolve_rev(ref, a or "HEAD")
                 right = await self.resolve_rev(ref, b or "HEAD")
-                title = (f"{a or 'HEAD'} → {b or 'HEAD'}" if sep == ".." else
-                         f"изменения {b or 'HEAD'} с момента ответвления от {a or 'HEAD'}")
+                b_title = f"PR #{_PR_RE.match(b).group(1)}" if _PR_RE.match(b or "") else (b or "HEAD")
+                if sep == "..." and not await self._ensure_merge_base(ref, left, right):
+                    return [f"{left}..{right}"], (f"{a or 'HEAD'} → {b_title} (общий предок не найден — "
+                                                   "показана полная разница)")
+                title = (f"{a or 'HEAD'} → {b_title}" if sep == ".." else
+                         f"изменения {b_title} с момента ответвления от {a or 'HEAD'}")
                 return [f"{left}{sep}{right}"], title
         rev = await self.resolve_rev(ref, spec)
         return [rev], f"рабочая копия против {spec}"

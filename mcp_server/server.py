@@ -477,8 +477,10 @@ def _register_repo_tools(mcp: FastMCP, repos: RepoManager) -> None:
                         max_chars: int = 30000, ctx: Optional[Context] = None) -> Dict[str, Any]:
         """Diff: без `spec` — незакоммиченные изменения (против HEAD) и новые файлы; 'staged' —
         подготовленные к коммиту; 'main..feature' — между ветками или коммитами ('a...b' — с момента
-        ответвления); одна ветка или коммит — рабочая копия против него. Файлы со статусом и числом
-        строк, патч обрезается до `max_chars`."""
+        ответвления); 'pr:12' — pull request (merge request в GitLab) от точки ответвления от базовой
+        ветки, в том числе из форка; одна ветка или коммит — рабочая копия против него. Файлы со статусом
+        и числом строк, патч обрезается до `max_chars`. Версию файла из PR читает repo_read_file с
+        ref='pr:12'."""
         return await run(ctx, "repo_diff", repo_id, lambda r: repos.diff(r, spec, path, max_chars))
 
     @reg("Авторство строк (blame)")
