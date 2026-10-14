@@ -13,7 +13,11 @@ mcp_server.server
 
 - «GIT API» — Git-хостинги (`git_host_*`), всегда;
 - «Локальный GIT» (`execute_git_command`, `git_pull`) — при `MCP_LOCAL_GIT_ENABLED`;
-- «HTTP-запросы» (`http_fetch`) — при `MCP_HTTP_FETCH_ENABLED`.
+- «HTTP-запросы» (`http_fetch`) — при `MCP_HTTP_FETCH_ENABLED`;
+- «Репозиторий» (`repo_*` — проект по ссылке, чтение кода и истории) и
+  «Репозиторий: запись» (`repo_commit`, `repo_undo_commit`, с пометкой
+  `agentscore/direct_only` — модели не предлагаются, их вызывает AgentsCore
+  после подтверждения пользователя) — при `MCP_REPOS_ENABLED`.
 
 Периодических задач здесь больше нет — они в отдельном сервисе
 планировщика (scheduler_service), который вызывает эти же инструменты по
@@ -38,13 +42,14 @@ from .git_hosts import GitHostError, SUPPORTED_HOSTS, get_provider
 from .llm import LLMClient
 from .pipeline import PipelineError, run_pipeline as run_pipeline_impl
 from .pipeline_tools import PipelineTools, ToolError
+from .repos import RepoError, RepoManager
 from .results import ResultNotFoundError, ResultStore
 from .snapshots import SnapshotError, SnapshotStore, extract_items
 from .web_pages import fetch_page
 from .web_search import make_ddgs_search
 
 _EXPECTED_ERRORS = (
-    ActionError, GitHostError, ValueError, ToolError, ResultNotFoundError, PipelineError, SnapshotError,
+    ActionError, GitHostError, ValueError, ToolError, ResultNotFoundError, PipelineError, SnapshotError, RepoError,
 )
 
 #: git_host_* возвращают список нормализованных элементов, один dict или
@@ -62,6 +67,12 @@ GROUP_WEB_SEARCH = "Интернет поиск"
 GROUP_LLM = "Обработка LLM"
 GROUP_FILES = "Работа с файлами"
 GROUP_PIPELINES = "Пайплайны"
+GROUP_REPO = "Репозиторий"
+GROUP_REPO_WRITE = "Репозиторий: запись"
+
+#: Ключ `_meta` инструмента: вызывается только сервисом напрямую (после
+#: подтверждения пользователя), модели не предлагается.
+DIRECT_ONLY_META_KEY = "agentscore/direct_only"
 
 
 def _group(name: str) -> Dict[str, Any]:
@@ -117,7 +128,19 @@ def build_pipeline_tools(features: Features) -> PipelineTools:
     )
 
 
-def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Optional[PipelineTools] = None) -> FastMCP:
+def build_repo_manager() -> RepoManager:
+    cfg = MCPConfig
+    return RepoManager(
+        cfg.repos_dir(), cfg.PROJECT_ROOTS, data_dir=cfg.DATA_DIR, clone_depth=cfg.REPO_CLONE_DEPTH,
+        fetch_interval=cfg.REPO_FETCH_INTERVAL, clone_timeout=cfg.REPO_CLONE_TIMEOUT,
+        allowed_hosts=cfg.repo_allowed_hosts(), credentials=cfg.git_credentials,
+    )
+
+
+def build_mcp_server(
+    features: Optional[Features] = None, pipeline_tools: Optional[PipelineTools] = None,
+    repo_manager: Optional[RepoManager] = None,
+) -> FastMCP:
     """`features` — какие включаемые группы регистрировать; по умолчанию —
     по настройкам `MCPConfig`. `pipeline_tools` — звенья пайплайнов (тесты
     передают свои, с подменённым поиском и моделью)."""
@@ -170,6 +193,10 @@ def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Option
                 return await http_fetch_action(url, method, headers, body, timeout)
             except _EXPECTED_ERRORS as exc:
                 return {"error": str(exc)}
+
+    if features.repos:
+        repos = repo_manager if repo_manager is not None else build_repo_manager()
+        _register_repo_tools(mcp, repos)
 
     async def _git_host_call(host: str, coro_factory) -> GitHostResult:
         if host not in SUPPORTED_HOSTS:
@@ -369,3 +396,125 @@ def build_mcp_server(features: Optional[Features] = None, pipeline_tools: Option
         return await _call(run_pipeline_impl(steps, tools, allowed=allowed, store=pipeline_tools.store))
 
     return mcp
+
+
+def _register_repo_tools(mcp: FastMCP, repos: RepoManager) -> None:
+    """Группа «Репозиторий». Все инструменты, кроме `repo_open`, принимают
+    `repo_id` из ответа `repo_open` (AgentsCore подставляет его сам — модель
+    этот параметр не видит)."""
+
+    def reg(title: str, group: str = GROUP_REPO, direct_only: bool = False):
+        meta = _group(group)
+        if direct_only:
+            meta[DIRECT_ONLY_META_KEY] = True
+        return mcp.tool(title=title, meta=meta)
+
+    def _check_allowed(ctx: Optional[Context], name: str) -> Optional[Dict[str, Any]]:
+        allowed = caller_allowed_tools(ctx)
+        if allowed is not None and name not in allowed:
+            return {"error": f"инструмент {name} не разрешён в этом чате"}
+        return None
+
+    async def run(ctx: Optional[Context], name: str, repo_id: str, fn) -> Dict[str, Any]:
+        denied = _check_allowed(ctx, name)
+        if denied:
+            return denied
+        try:
+            ref = repos.resolve(repo_id)
+            return await fn(ref)
+        except _EXPECTED_ERRORS as exc:
+            return {"error": str(exc)}
+
+    @reg("Открыть проект по ссылке")
+    async def repo_open(link: str, branch: Optional[str] = None, refresh: bool = True,
+                        ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Открывает проект: URL репозитория GitHub / GitLab / Gitea (можно с /tree/<ветка>) — неглубокий
+        клон на сервере, при повторном открытии обновляется; либо локальный путь рабочей копии внутри
+        разрешённых папок. Возвращает repo_id (его принимают остальные инструменты «Репозиторий»), ветку,
+        ветку по умолчанию, адрес origin, последний коммит и writable (коммиты возможны только в
+        локальной рабочей копии)."""
+        denied = _check_allowed(ctx, "repo_open")
+        if denied:
+            return denied
+        try:
+            return await repos.open(link, branch, refresh)
+        except _EXPECTED_ERRORS as exc:
+            return {"error": str(exc)}
+
+    @reg("Состояние репозитория")
+    async def repo_status(repo_id: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Текущая ветка, последний коммит, отставание/опережение origin (ahead/behind), изменённые,
+        подготовленные и новые файлы."""
+        return await run(ctx, "repo_status", repo_id, repos.status)
+
+    @reg("История коммитов")
+    async def repo_log(repo_id: str, path: Optional[str] = None, ref: Optional[str] = None, limit: int = 20,
+                       author: Optional[str] = None, grep: Optional[str] = None, since: Optional[str] = None,
+                       ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Коммиты (sha, автор, дата, заголовок), новые сверху. `path` — только затрагивающие файл или
+        папку; `ref` — ветка или коммит (по умолчанию текущая ветка); `grep` — поиск по сообщению;
+        `since` — например '2 weeks ago' или '2026-09-01'; `limit` до 100."""
+        return await run(ctx, "repo_log", repo_id, lambda r: repos.log(r, path, ref, limit, author, grep, since))
+
+    @reg("Коммит подробно")
+    async def repo_show(repo_id: str, commit: str, path: Optional[str] = None, max_chars: int = 20000,
+                        ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Сообщение коммита, список файлов с числом строк и патч (обрезается до `max_chars`);
+        `path` — только изменения этого файла."""
+        return await run(ctx, "repo_show", repo_id, lambda r: repos.show(r, commit, path, max_chars))
+
+    @reg("Поиск по коду")
+    async def repo_grep(repo_id: str, pattern: str, path: Optional[str] = None, ignore_case: bool = True,
+                        fixed: bool = False, max_results: int = 50, ref: Optional[str] = None,
+                        ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """git grep по файлам репозитория: строки (path, line, text). `pattern` — регулярное выражение
+        (fixed=true — обычная строка); `path` — папка или файл; `ref` — искать в ветке или коммите."""
+        return await run(ctx, "repo_grep", repo_id,
+                         lambda r: repos.grep(r, pattern, path, ignore_case, fixed, max_results, ref))
+
+    @reg("Изменения (diff)")
+    async def repo_diff(repo_id: str, spec: Optional[str] = None, path: Optional[str] = None,
+                        max_chars: int = 30000, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Diff: без `spec` — незакоммиченные изменения (против HEAD) и новые файлы; 'staged' —
+        подготовленные к коммиту; 'main..feature' — между ветками или коммитами ('a...b' — с момента
+        ответвления); одна ветка или коммит — рабочая копия против него. Файлы со статусом и числом
+        строк, патч обрезается до `max_chars`."""
+        return await run(ctx, "repo_diff", repo_id, lambda r: repos.diff(r, spec, path, max_chars))
+
+    @reg("Авторство строк (blame)")
+    async def repo_blame(repo_id: str, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
+                         ref: Optional[str] = None, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Кто и в каком коммите последний раз менял строки файла (до 200 строк за вызов) и сводка по
+        коммитам."""
+        return await run(ctx, "repo_blame", repo_id, lambda r: repos.blame(r, path, start_line, end_line, ref))
+
+    @reg("Список файлов проекта")
+    async def repo_list_files(repo_id: str, path: Optional[str] = None, depth: int = 2,
+                              pattern: Optional[str] = None, max_entries: int = 300,
+                              ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Дерево файлов под контролем git: папки (с числом файлов) и файлы до глубины `depth` от `path`.
+        `pattern` — маска ('*.kt', 'docs/*.md') — плоский список подходящих файлов."""
+        return await run(ctx, "repo_list_files", repo_id,
+                         lambda r: repos.list_files(r, path, depth, pattern, max_entries))
+
+    @reg("Чтение файла проекта")
+    async def repo_read_file(repo_id: str, path: str, ref: Optional[str] = None, start_line: Optional[int] = None,
+                             end_line: Optional[int] = None, max_chars: int = 20000,
+                             ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Текст файла с номерами строк (диапазон start_line..end_line, обрезка до `max_chars`);
+        `ref` — версия из ветки или коммита."""
+        return await run(ctx, "repo_read_file", repo_id,
+                         lambda r: repos.read_file(r, path, ref, start_line, end_line, max_chars))
+
+    @reg("Коммит изменений", GROUP_REPO_WRITE, direct_only=True)
+    async def repo_commit(repo_id: str, message: str, files: Optional[List[str]] = None,
+                          ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Коммит в локальной рабочей копии: `files` — какие файлы добавить в коммит (без них —
+        только уже подготовленные). Вызывается после подтверждения пользователя."""
+        return await run(ctx, "repo_commit", repo_id, lambda r: repos.commit(r, message, files))
+
+    @reg("Откат коммита", GROUP_REPO_WRITE, direct_only=True)
+    async def repo_undo_commit(repo_id: str, commit: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Откатывает последний коммит, сделанный через repo_commit (git reset --soft HEAD~1, изменения
+        остаются в индексе), если он ещё не отправлен в удалённый репозиторий."""
+        return await run(ctx, "repo_undo_commit", repo_id, lambda r: repos.undo_commit(r, commit))

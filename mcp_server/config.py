@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 
 #: Откуда загружен `.env` (None — файл не найден); печатается при старте.
@@ -43,6 +44,11 @@ def _load_dotenv(path: str = ".env") -> None:
 
 
 _load_dotenv()
+
+
+def _list_env(name: str) -> List[str]:
+    raw = os.environ.get(name, "")
+    return [p.strip() for p in raw.replace(";", ",").replace("\n", ",").split(",") if p.strip()]
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -87,6 +93,23 @@ class MCPConfig:
     # Промежуточные результаты шагов (result_id) и сколько их хранить.
     DATA_DIR: str = os.environ.get("MCP_DATA_DIR", "mcp_data").strip() or "mcp_data"
     RESULT_TTL_HOURS: float = float(os.environ.get("MCP_RESULT_TTL_HOURS", "24") or "24")
+
+    # --- Репозиторий (ассистент разработчика) --------------------------------
+    # Группа «Репозиторий»: repo_open (клон по URL или локальная копия) и
+    # чтение/коммит рабочих копий. Клоны по URL — в MCP_REPOS_DIR (по
+    # умолчанию MCP_DATA_DIR/repos), локальные проекты — только внутри
+    # MCP_PROJECT_ROOTS (через запятую или «;»).
+    REPOS_ENABLED: bool = _bool_env("MCP_REPOS_ENABLED")
+    REPOS_DIR: str = os.environ.get("MCP_REPOS_DIR", "").strip()
+    PROJECT_ROOTS: List[str] = _list_env("MCP_PROJECT_ROOTS")
+    # Глубина клона (коммитов истории); 0 — полная история.
+    REPO_CLONE_DEPTH: int = int(os.environ.get("MCP_REPO_CLONE_DEPTH", "200") or "200")
+    # Не чаще, чем раз в столько секунд, клон обновляется (git fetch) при repo_open.
+    REPO_FETCH_INTERVAL: float = float(os.environ.get("MCP_REPO_FETCH_INTERVAL", "60") or "60")
+    REPO_CLONE_TIMEOUT: float = float(os.environ.get("MCP_REPO_CLONE_TIMEOUT", "300") or "300")
+    # С каких хостов можно клонировать: пусто — github.com, gitlab.com,
+    # gitea.com и хосты из *_API_URL; «*» — любые.
+    REPO_ALLOWED_HOSTS: List[str] = _list_env("MCP_REPO_ALLOWED_HOSTS")
 
     HOST: str = os.environ.get("MCP_HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("MCP_PORT", "8001"))
@@ -133,3 +156,34 @@ class MCPConfig:
     @classmethod
     def api_url_for(cls, host: str) -> str:
         return getattr(cls, f"{host.upper()}_API_URL")
+
+    @classmethod
+    def repos_dir(cls) -> str:
+        return cls.REPOS_DIR or os.path.join(cls.DATA_DIR, "repos")
+
+    @classmethod
+    def _web_host(cls, host: str) -> str:
+        api = (urlparse(getattr(cls, f"{host.upper()}_API_URL")).hostname or "").lower()
+        return "github.com" if api == "api.github.com" else api
+
+    @classmethod
+    def repo_allowed_hosts(cls) -> List[str]:
+        if cls.REPO_ALLOWED_HOSTS:
+            return [h.lower() for h in cls.REPO_ALLOWED_HOSTS]
+        hosts = {"github.com", "gitlab.com", "gitea.com"}
+        hosts.update(h for h in (cls._web_host(x) for x in ("github", "gitlab", "gitea")) if h)
+        return sorted(hosts)
+
+    @classmethod
+    def git_credentials(cls, host: str) -> Optional[Tuple[str, str]]:
+        """Логин и токен для git по HTTPS: токены хостингов из этого же
+        конфига (GITHUB_TOKEN, GITLAB_TOKEN, GITEA_TOKEN) — только для их хоста."""
+        host = (host or "").lower()
+        if cls.GITHUB_TOKEN and host == cls._web_host("github"):
+            return "x-access-token", cls.GITHUB_TOKEN
+        if cls.GITLAB_TOKEN and host == cls._web_host("gitlab"):
+            return "oauth2", cls.GITLAB_TOKEN
+        if cls.GITEA_TOKEN and host == cls._web_host("gitea"):
+            # Gitea: токен в имени пользователя, пароль x-oauth-basic.
+            return cls.GITEA_TOKEN, "x-oauth-basic"
+        return None

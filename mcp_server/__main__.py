@@ -46,6 +46,11 @@ def main() -> None:
     print(f"[mcp_server] Обработка LLM (MCP_LLM_ENABLED): {_onoff(features.llm)}{llm_note}")
     files_note = f" (каталог {os.path.abspath(MCPConfig.FILES_DIR)})" if features.files else ""
     print(f"[mcp_server] Работа с файлами (MCP_FILES_ENABLED): {_onoff(features.files)}{files_note}")
+    repos_note = ""
+    if features.repos:
+        roots = ", ".join(MCPConfig.PROJECT_ROOTS) or "не заданы"
+        repos_note = f" (клоны: {os.path.abspath(MCPConfig.repos_dir())}; локальные проекты: {roots})"
+    print(f"[mcp_server] Репозиторий (MCP_REPOS_ENABLED): {_onoff(features.repos)}{repos_note}")
     tools = asyncio.run(app.state.mcp.list_tools())
     print(f"[mcp_server] Инструменты ({len(tools)}): {', '.join(t.name for t in tools)}")
     uvicorn.run(app, host=MCPConfig.HOST, port=MCPConfig.PORT)

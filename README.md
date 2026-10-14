@@ -56,6 +56,9 @@ python -m mcp_server
 | `MCP_LLM_BASE_URL`, `MCP_LLM_MODEL`, `MCP_LLM_TIMEOUT`, `MCP_LLM_MAX_TOKENS` | OpenAI-совместимый API модели (по умолчанию DeepSeek, `deepseek-v4-flash`) |
 | `MCP_FILES_ENABLED`, `MCP_FILES_DIR` | «Работа с файлами»: `save_to_text_file` и каталог файлов (`mcp_files`) |
 | `MCP_DATA_DIR`, `MCP_RESULT_TTL_HOURS` | промежуточные результаты шагов (`result_id`) и срок их хранения (24 ч) |
+| `MCP_REPOS_ENABLED` | «Репозиторий»: проекты по ссылке для ассистента разработчика (`repo_*`); по умолчанию **выключено** |
+| `MCP_REPOS_DIR`, `MCP_PROJECT_ROOTS` | папка клонов (по умолчанию `MCP_DATA_DIR/repos`); папки, где разрешено открывать локальные рабочие копии |
+| `MCP_REPO_CLONE_DEPTH`, `MCP_REPO_FETCH_INTERVAL`, `MCP_REPO_CLONE_TIMEOUT`, `MCP_REPO_ALLOWED_HOSTS` | глубина клона (200), частота `git fetch` (60 с), таймаут клона (300 с), разрешённые хосты |
 
 ### Включаемые возможности
 
@@ -90,6 +93,15 @@ Git-хостингов (`git_host_*`) и цепочка `run_pipeline` дост�
 - `save_tool_result(tool, args=None, reset=False, max_items=100)` — «Сохранять ответ
   инструмента» (группа «Работа с файлами»), см. ниже.
 - `run_pipeline(steps)` — «Цепочка инструментов» (группа «Пайплайны»).
+
+Группа «Репозиторий» (при `MCP_REPOS_ENABLED`, см. раздел ниже):
+
+- `repo_open(link, branch=None, refresh=True)` — открыть проект по ссылке → `repo_id`;
+- `repo_status(repo_id)`, `repo_log(repo_id, path, ref, limit, author, grep, since)`,
+  `repo_show(repo_id, commit, path)`, `repo_grep(repo_id, pattern, path, …)`,
+  `repo_diff(repo_id, spec, path)`, `repo_blame(repo_id, path, start_line, end_line)`,
+  `repo_list_files(repo_id, path, depth, pattern)`, `repo_read_file(repo_id, path, ref, start_line, end_line)`;
+- «Репозиторий: запись»: `repo_commit(repo_id, message, files)`, `repo_undo_commit(repo_id, commit)`.
 
 У каждого инструмента есть `title` — краткое русское описание для интерфейса.
 Группа инструмента передаётся в `_meta["agentscore/group"]`: «GIT API»
@@ -239,6 +251,53 @@ OpenAI-совместимому API (`MCP_LLM_*`, по умолчанию DeepSe
 получает только новые коммиты. Первый полный отчёт ограничен одним запросом к
 хостингу — до 100 последних коммитов.
 
+## Репозиторий: проекты для ассистента разработчика
+
+Группа включается `MCP_REPOS_ENABLED=true`. Ею пользуется AgentsCore для команд
+разработчика (`/ask`, `/status`, `/diff`, `/review`, `/commit` …).
+
+**Проект по ссылке.** `repo_open(link)` принимает:
+
+| Ссылка | Что происходит |
+|---|---|
+| `https://github.com/owner/repo` | неглубокий клон (`MCP_REPO_CLONE_DEPTH`) ветки по умолчанию в `MCP_REPOS_DIR/github.com/owner/repo/<ветка>` |
+| `…/tree/feature-x`, `…/blob/dev/…` | клон ветки `feature-x` / `dev` |
+| GitLab `group/sub/repo/-/tree/<ветка>`, Gitea `…/src/branch/<ветка>`, `git@host:o/r.git` | так же |
+| `/home/ivan/projects/agents`, `C:\projects\agents` | локальная рабочая копия на месте — только внутри `MCP_PROJECT_ROOTS` |
+
+Повторный `repo_open` той же ссылки обновляет клон (`git fetch` + переход на свежий
+коммит ветки, не чаще `MCP_REPO_FETCH_INTERVAL`). Отсутствующая в клоне ветка
+догружается при первом обращении (`repo_diff(spec="main..feature")`). Закрытые
+репозитории клонируются по токенам `GITHUB_TOKEN`, `GITLAB_TOKEN`, `GITEA_TOKEN`:
+токен передаётся git через переменные окружения процесса, только для своего хоста,
+и не сохраняется в `.git/config`.
+
+**`repo_id`** — `git:<host>/<owner>/<repo>#<ветка>` или `local:<путь>`. Все остальные
+инструменты принимают только его, а не произвольный путь, поэтому за пределы
+клонов и `MCP_PROJECT_ROOTS` они не выходят. Пути внутри проекта проверяются
+(`..`, `.git`, символические ссылки наружу).
+
+**Чтение:** состояние и изменённые файлы, история, коммит с патчем, `git grep`,
+diff (без `spec` — незакоммиченные изменения и новые файлы; `staged`; `a..b`;
+`a...b`; одна ветка), `blame`, дерево файлов, файл с номерами строк. Большие ответы
+обрезаются (`max_chars`, `truncated: true`).
+
+**Запись** (группа «Репозиторий: запись», `_meta["agentscore/direct_only"]=true` —
+AgentsCore не предлагает эти инструменты модели и вызывает их сам после
+подтверждения пользователя):
+
+- `repo_commit` — только в локальной рабочей копии; `files` — какие файлы включить
+  (`git add -A -- files`), без них коммитится уже подготовленное;
+- `repo_undo_commit` — `git reset --soft HEAD~1`, только для коммита, сделанного
+  через `repo_commit` (журнал `MCP_DATA_DIR/repo_commits.json`), если он последний и
+  ещё не отправлен в удалённый репозиторий.
+
+`push`, создание pull request'ов и правка файлов не поддерживаются.
+
+**knowledge_service.** Чтобы AgentsCore построил базу знаний проекта, папка
+клонов и `MCP_PROJECT_ROOTS` должны входить в `KB_ROOTS` knowledge_service, а
+сервисы — работать на одном компьютере (общая файловая система).
+
 ## REST API (`/api`, для AgentsApp)
 
 | Метод | Путь | Назначение |
@@ -276,6 +335,10 @@ OpenAI-совместимому API (`MCP_LLM_*`, по умолчанию DeepSe
 - `read_web_page` и `summarize(depth="pages")` загружают только публичные
   адреса (проверка IP после каждого редиректа), не больше 2 МБ на страницу.
   `http_fetch` такой проверки не делает — поэтому он выключен по умолчанию.
+- «Репозиторий» (`MCP_REPOS_ENABLED`) выключен по умолчанию. Клонирует только с
+  разрешённых хостов, локальные копии — только внутри `MCP_PROJECT_ROOTS`; git
+  запускается без shell, ветки и пути проверяются (`-` в начале, `..`, выход за
+  пределы копии). Коммит — только по явной команде с подтверждением, push нет.
 - `save_to_text_file` пишет только внутри `MCP_FILES_DIR` и только текстовые
   расширения; ключ модели (`MCP_LLM_API_KEY`) не логируется.
 - Токены Git-хостингов никогда не попадают в логи (проверено в
@@ -339,6 +402,7 @@ mcp_server/
   pipeline_tools.py # duckduckgo_search, read_web_page, summarize, save_to_text_file
   pipeline.py       # run_pipeline: ссылки $prev, трасса, проверки
   snapshots.py      # save_tool_result: снимки ответов по чатам и дельта
+  repos.py          # «Репозиторий»: repo_open, чтение, коммит и откат
   api.py            # REST-роутер для AgentsApp
   schemas.py        # Pydantic-схемы REST API
   deps.py           # FastAPI Depends

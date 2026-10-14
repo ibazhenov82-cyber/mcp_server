@@ -11,6 +11,9 @@ mcp_server.features
 - `web_search` (`MCP_WEB_SEARCH_ENABLED`) — «Интернет поиск»: `duckduckgo_search`, `read_web_page`.
 - `llm` (`MCP_LLM_ENABLED` и `MCP_LLM_API_KEY`) — «Обработка LLM»: `summarize`.
 - `files` (`MCP_FILES_ENABLED`) — «Работа с файлами»: `save_to_text_file`.
+- `repos` (`MCP_REPOS_ENABLED`) — «Репозиторий»: `repo_open`, `repo_status`, `repo_log`,
+  `repo_show`, `repo_grep`, `repo_diff`, `repo_blame`, `repo_list_files`, `repo_read_file`;
+  «Репозиторий: запись»: `repo_commit`, `repo_undo_commit`.
 
 Всегда доступны: Git-хостинги (`git_host_*`) и «Пайплайны» (`run_pipeline`).
 """
@@ -29,6 +32,7 @@ class Features:
     web_search: bool = False
     llm: bool = False
     files: bool = False
+    repos: bool = False
 
     @classmethod
     def from_config(cls) -> "Features":
@@ -38,8 +42,9 @@ class Features:
             web_search=MCPConfig.WEB_SEARCH_ENABLED,
             llm=MCPConfig.LLM_ENABLED and bool(MCPConfig.LLM_API_KEY),
             files=MCPConfig.FILES_ENABLED,
+            repos=MCPConfig.REPOS_ENABLED,
         )
 
     @classmethod
     def all_enabled(cls) -> "Features":
-        return cls(local_git=True, http_fetch=True, web_search=True, llm=True, files=True)
+        return cls(local_git=True, http_fetch=True, web_search=True, llm=True, files=True, repos=True)
