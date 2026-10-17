@@ -17,7 +17,10 @@ mcp_server.server
 - «Репозиторий» (`repo_*` — проект по ссылке, чтение кода и истории) и
   «Репозиторий: запись» (`repo_commit`, `repo_undo_commit`, с пометкой
   `agentscore/direct_only` — модели не предлагаются, их вызывает AgentsCore
-  после подтверждения пользователя) — при `MCP_REPOS_ENABLED`.
+  после подтверждения пользователя) — при `MCP_REPOS_ENABLED`;
+- «Пользователи» (`user_get`, `users_search`, `users_list` — справочник
+  пользователей сервиса поддержки из JSON-файла; `users_list` — только для
+  прямого вызова сервисом) — при `MCP_USERS_ENABLED`.
 
 Периодических задач здесь больше нет — они в отдельном сервисе
 планировщика (scheduler_service), который вызывает эти же инструменты по
@@ -43,6 +46,7 @@ from .llm import LLMClient
 from .pipeline import PipelineError, run_pipeline as run_pipeline_impl
 from .pipeline_tools import PipelineTools, ToolError
 from .repos import RepoError, RepoManager
+from .users import UserDirectory, UsersError
 from .results import ResultNotFoundError, ResultStore
 from .snapshots import SnapshotError, SnapshotStore, extract_items
 from .web_pages import fetch_page
@@ -50,6 +54,7 @@ from .web_search import make_ddgs_search
 
 _EXPECTED_ERRORS = (
     ActionError, GitHostError, ValueError, ToolError, ResultNotFoundError, PipelineError, SnapshotError, RepoError,
+    UsersError,
 )
 
 #: git_host_* возвращают список нормализованных элементов, один dict или
@@ -69,6 +74,7 @@ GROUP_FILES = "Работа с файлами"
 GROUP_PIPELINES = "Пайплайны"
 GROUP_REPO = "Репозиторий"
 GROUP_REPO_WRITE = "Репозиторий: запись"
+GROUP_USERS = "Пользователи"
 
 #: Ключ `_meta` инструмента: вызывается только сервисом напрямую (после
 #: подтверждения пользователя), модели не предлагается.
@@ -139,7 +145,7 @@ def build_repo_manager() -> RepoManager:
 
 def build_mcp_server(
     features: Optional[Features] = None, pipeline_tools: Optional[PipelineTools] = None,
-    repo_manager: Optional[RepoManager] = None,
+    repo_manager: Optional[RepoManager] = None, user_directory: Optional[UserDirectory] = None,
 ) -> FastMCP:
     """`features` — какие включаемые группы регистрировать; по умолчанию —
     по настройкам `MCPConfig`. `pipeline_tools` — звенья пайплайнов (тесты
@@ -197,6 +203,10 @@ def build_mcp_server(
     if features.repos:
         repos = repo_manager if repo_manager is not None else build_repo_manager()
         _register_repo_tools(mcp, repos)
+
+    if features.users:
+        users = user_directory if user_directory is not None else UserDirectory(MCPConfig.users_file())
+        _register_user_tools(mcp, users)
 
     async def _git_host_call(host: str, coro_factory) -> GitHostResult:
         if host not in SUPPORTED_HOSTS:
@@ -396,6 +406,47 @@ def build_mcp_server(
         return await _call(run_pipeline_impl(steps, tools, allowed=allowed, store=pipeline_tools.store))
 
     return mcp
+
+
+def _register_user_tools(mcp: FastMCP, users: UserDirectory) -> None:
+    """Группа «Пользователи»: справочник пользователей поддержки. AgentsCore
+    в чате поддержки подставляет `user_id` сам — модель видит только
+    данные своего собеседника."""
+
+    def reg(title: str, direct_only: bool = False):
+        meta = _group(GROUP_USERS)
+        if direct_only:
+            meta[DIRECT_ONLY_META_KEY] = True
+        return mcp.tool(title=title, meta=meta)
+
+    async def run(ctx: Optional[Context], name: str, fn) -> Dict[str, Any]:
+        allowed = caller_allowed_tools(ctx)
+        if allowed is not None and name not in allowed:
+            return {"error": f"инструмент {name} не разрешён в этом чате"}
+        try:
+            return await asyncio.to_thread(fn)
+        except _EXPECTED_ERRORS as exc:
+            return {"error": str(exc)}
+
+    @reg("Данные пользователя")
+    async def user_get(user_id: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Карточка пользователя по id: фамилия, имя, отчество, полное имя, обращение (имя и отчество),
+        проект, профиль (например «Технический специалист» или «Пользователь») и дополнительные поля."""
+        return await run(ctx, "user_get", lambda: users.get(user_id))
+
+    @reg("Поиск пользователей")
+    async def users_search(query: str, project: Optional[str] = None, limit: int = 20,
+                           ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Поиск пользователей по словам из id, ФИО, проекта и профиля (все слова должны встретиться);
+        project — только пользователи этого проекта (без учёта регистра)."""
+        return await run(ctx, "users_search", lambda: users.search(query, project, limit))
+
+    @reg("Список пользователей", direct_only=True)
+    async def users_list(project: Optional[str] = None, profile: Optional[str] = None, limit: int = 500,
+                         offset: int = 0, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """Список пользователей (постранично) с фильтром по проекту и профилю; version — отпечаток файла
+        справочника (меняется при любой правке)."""
+        return await run(ctx, "users_list", lambda: users.list(project, profile, limit, offset))
 
 
 def _register_repo_tools(mcp: FastMCP, repos: RepoManager) -> None:

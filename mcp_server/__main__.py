@@ -51,6 +51,8 @@ def main() -> None:
         roots = ", ".join(MCPConfig.PROJECT_ROOTS) or "не заданы"
         repos_note = f" (клоны: {os.path.abspath(MCPConfig.repos_dir())}; локальные проекты: {roots})"
     print(f"[mcp_server] Репозиторий (MCP_REPOS_ENABLED): {_onoff(features.repos)}{repos_note}")
+    users_note = f" (файл {os.path.abspath(MCPConfig.users_file())})" if features.users else ""
+    print(f"[mcp_server] Пользователи (MCP_USERS_ENABLED): {_onoff(features.users)}{users_note}")
     tools = asyncio.run(app.state.mcp.list_tools())
     print(f"[mcp_server] Инструменты ({len(tools)}): {', '.join(t.name for t in tools)}")
     uvicorn.run(app, host=MCPConfig.HOST, port=MCPConfig.PORT)

@@ -22,6 +22,7 @@ class StatusOut(BaseModel):
     llm_model: str = Field("", description="Модель суммарного ответа")
     files_enabled: bool = Field(False, description="Сохранение в текстовые файлы (MCP_FILES_ENABLED)")
     repos_enabled: bool = Field(False, description="Репозиторий: проекты по ссылке для ассистента разработчика (MCP_REPOS_ENABLED)")
+    users_enabled: bool = Field(False, description="Пользователи: справочник пользователей сервиса поддержки (MCP_USERS_ENABLED)")
 
 
 class FileInfoOut(BaseModel):

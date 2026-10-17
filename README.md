@@ -59,6 +59,7 @@ python -m mcp_server
 | `MCP_REPOS_ENABLED` | «Репозиторий»: проекты по ссылке для ассистента разработчика (`repo_*`); по умолчанию **выключено** |
 | `MCP_REPOS_DIR`, `MCP_PROJECT_ROOTS` | папка клонов (по умолчанию `MCP_DATA_DIR/repos`); папки, где разрешено открывать локальные рабочие копии |
 | `MCP_REPO_CLONE_DEPTH`, `MCP_REPO_FETCH_INTERVAL`, `MCP_REPO_CLONE_TIMEOUT`, `MCP_REPO_ALLOWED_HOSTS` | глубина клона (200), частота `git fetch` (60 с), таймаут клона (300 с), разрешённые хосты |
+| `MCP_USERS_ENABLED`, `MCP_USERS_FILE` | «Пользователи»: справочник пользователей сервиса поддержки и его JSON-файл (по умолчанию `MCP_DATA_DIR/users.json`); по умолчанию **выключено** |
 
 ### Включаемые возможности
 
@@ -102,6 +103,12 @@ Git-хостингов (`git_host_*`) и цепочка `run_pipeline` дост�
   `repo_diff(repo_id, spec, path)`, `repo_blame(repo_id, path, start_line, end_line)`,
   `repo_list_files(repo_id, path, depth, pattern)`, `repo_read_file(repo_id, path, ref, start_line, end_line)`;
 - «Репозиторий: запись»: `repo_commit(repo_id, message, files)`, `repo_undo_commit(repo_id, commit)`.
+
+Группа «Пользователи» (при `MCP_USERS_ENABLED`, см. раздел ниже):
+
+- `user_get(user_id)` — карточка пользователя;
+- `users_search(query, project=None, limit=20)` — поиск по id, ФИО, проекту и профилю;
+- `users_list(project=None, profile=None, limit=500, offset=0)` — список (только прямой вызов сервисом).
 
 У каждого инструмента есть `title` — краткое русское описание для интерфейса.
 Группа инструмента передаётся в `_meta["agentscore/group"]`: «GIT API»
@@ -307,6 +314,38 @@ AgentsCore не предлагает эти инструменты модели 
 клонов и `MCP_PROJECT_ROOTS` должны входить в `KB_ROOTS` knowledge_service, а
 сервисы — работать на одном компьютере (общая файловая система).
 
+## Пользователи: справочник сервиса поддержки
+
+Базы пользователей нет: справочник — JSON-файл `MCP_USERS_FILE` (пример —
+`examples/users.example.json`). Сервер читает его при первом обращении и
+перечитывает, только когда меняются время изменения или размер файла, —
+файл можно править без перезапуска.
+
+```json
+{"users": [
+  {"id": "u-1001", "last_name": "Петров", "first_name": "Иван", "middle_name": "Сергеевич",
+   "project": "AgentsCore", "profile": "Технический специалист", "position": "Инженер внедрения"}
+]}
+```
+
+| Поле | Обязательно | Примечание |
+|---|---|---|
+| `id` | да | уникален в файле |
+| `first_name` | да | имя |
+| `last_name`, `middle_name` | нет | фамилия, отчество |
+| `project` | нет | название проекта; AgentsCore ищет проект в справочнике «Проекты» по названию без учёта регистра |
+| `profile` | нет | «Технический специалист», «Пользователь», «Администратор» и т. п.; AgentsCore ищет профиль агента с этим именем |
+
+Вместо английских ключей можно писать «Фамилия», «Имя», «Отчество»,
+«Проект», «Профиль». Прочие поля возвращаются в `extra`. В ответах есть
+`full_name` («Петров Иван Сергеевич»), `display_name` — обращение по имени и
+отчеству («Иван Сергеевич») и `version` — отпечаток содержимого файла:
+по нему AgentsCore понимает, что его кэш пользователей устарел.
+
+`users_list` помечен `agentscore/direct_only`: модели он не предлагается,
+его вызывает AgentsCore для экрана выбора пользователя. В чате поддержки
+модели доступен только `user_get`, и `user_id` AgentsCore подставляет сам.
+
 ## REST API (`/api`, для AgentsApp)
 
 | Метод | Путь | Назначение |
@@ -412,6 +451,7 @@ mcp_server/
   pipeline.py       # run_pipeline: ссылки $prev, трасса, проверки
   snapshots.py      # save_tool_result: снимки ответов по чатам и дельта
   repos.py          # «Репозиторий»: repo_open, чтение, коммит и откат
+  users.py          # «Пользователи»: справочник из JSON-файла с кэшем по mtime
   api.py            # REST-роутер для AgentsApp
   schemas.py        # Pydantic-схемы REST API
   deps.py           # FastAPI Depends

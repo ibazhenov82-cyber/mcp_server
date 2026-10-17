@@ -48,6 +48,7 @@ async def get_status(mcp: FastMCP = Depends(get_mcp), features: Features = Depen
         llm_model=MCPConfig.LLM_MODEL if features.llm else "",
         files_enabled=features.files,
         repos_enabled=features.repos,
+        users_enabled=features.users,
     )
 
 

@@ -1,0 +1,14 @@
+{
+  "users": [
+    {"id": "u-1001", "last_name": "Петров", "first_name": "Иван", "middle_name": "Сергеевич",
+     "project": "AgentsCore", "profile": "Технический специалист", "position": "Инженер внедрения"},
+    {"id": "u-1002", "last_name": "Смирнова", "first_name": "Анна", "middle_name": "Викторовна",
+     "project": "AgentsCore", "profile": "Пользователь", "position": "Менеджер проекта"},
+    {"id": "u-1003", "last_name": "Ким", "first_name": "Алексей",
+     "project": "AgentsCore", "profile": "Администратор"},
+    {"id": "u-2001", "last_name": "Кузнецова", "first_name": "Мария", "middle_name": "Олеговна",
+     "project": "Knowledge Service", "profile": "Пользователь"},
+    {"id": "u-2002", "last_name": "Орлов", "first_name": "Дмитрий", "middle_name": "Павлович",
+     "project": "Knowledge Service", "profile": "Технический специалист"}
+  ]
+}

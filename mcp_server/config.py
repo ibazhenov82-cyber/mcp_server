@@ -111,6 +111,12 @@ class MCPConfig:
     # gitea.com и хосты из *_API_URL; «*» — любые.
     REPO_ALLOWED_HOSTS: List[str] = _list_env("MCP_REPO_ALLOWED_HOSTS")
 
+    # --- Пользователи (сервис поддержки) -------------------------------------
+    # Группа «Пользователи»: справочник из JSON-файла (по умолчанию
+    # MCP_DATA_DIR/users.json), перечитывается при изменении файла.
+    USERS_ENABLED: bool = _bool_env("MCP_USERS_ENABLED")
+    USERS_FILE: str = os.environ.get("MCP_USERS_FILE", "").strip()
+
     HOST: str = os.environ.get("MCP_HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("MCP_PORT", "8001"))
 
@@ -156,6 +162,10 @@ class MCPConfig:
     @classmethod
     def api_url_for(cls, host: str) -> str:
         return getattr(cls, f"{host.upper()}_API_URL")
+
+    @classmethod
+    def users_file(cls) -> str:
+        return cls.USERS_FILE or os.path.join(cls.DATA_DIR, "users.json")
 
     @classmethod
     def repos_dir(cls) -> str:

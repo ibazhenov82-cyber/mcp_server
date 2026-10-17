@@ -14,6 +14,7 @@ mcp_server.features
 - `repos` (`MCP_REPOS_ENABLED`) — «Репозиторий»: `repo_open`, `repo_status`, `repo_log`,
   `repo_show`, `repo_grep`, `repo_diff`, `repo_blame`, `repo_list_files`, `repo_read_file`;
   «Репозиторий: запись»: `repo_commit`, `repo_undo_commit`.
+- `users` (`MCP_USERS_ENABLED`) — «Пользователи»: `user_get`, `users_search`, `users_list`.
 
 Всегда доступны: Git-хостинги (`git_host_*`) и «Пайплайны» (`run_pipeline`).
 """
@@ -33,6 +34,7 @@ class Features:
     llm: bool = False
     files: bool = False
     repos: bool = False
+    users: bool = False
 
     @classmethod
     def from_config(cls) -> "Features":
@@ -43,8 +45,9 @@ class Features:
             llm=MCPConfig.LLM_ENABLED and bool(MCPConfig.LLM_API_KEY),
             files=MCPConfig.FILES_ENABLED,
             repos=MCPConfig.REPOS_ENABLED,
+            users=MCPConfig.USERS_ENABLED,
         )
 
     @classmethod
     def all_enabled(cls) -> "Features":
-        return cls(local_git=True, http_fetch=True, web_search=True, llm=True, files=True, repos=True)
+        return cls(local_git=True, http_fetch=True, web_search=True, llm=True, files=True, repos=True, users=True)
